@@ -60,10 +60,16 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
     func requestPermission() {
         Task {
             let center = UNUserNotificationCenter.current()
-            let settings = await center.notificationSettings()
+            // Keep the SDK's non-Sendable settings inside its callback.
+            let authorizationStatusRawValue: Int = await withCheckedContinuation { continuation in
+                center.getNotificationSettings { @Sendable settings in
+                    continuation.resume(returning: settings.authorizationStatus.rawValue)
+                }
+            }
+            let authorizationStatus = UNAuthorizationStatus(rawValue: authorizationStatusRawValue)
 
-            guard settings.authorizationStatus == .notDetermined else {
-                if settings.authorizationStatus == .denied {
+            guard authorizationStatus == .notDetermined else {
+                if authorizationStatus == .denied {
                     log.info("Notification permission previously denied — user must enable in System Settings")
                 }
                 return
