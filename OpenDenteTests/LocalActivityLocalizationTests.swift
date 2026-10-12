@@ -8,13 +8,15 @@ struct LocalActivityLocalizationTests {
     @Test func changingPresentationLanguageDoesNotRewriteTheEvent() throws {
         let event = LocalActivityEvent(category: .nativePolicy, code: "native.limitConfirmed",
                                        values: ["limit": "80", "external": "false"])
-        let before = try JSONEncoder().encode(event)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let before = try encoder.encode(event)
         let english = event.localizedSummary(language: .english)
         let spanish = event.localizedSummary(language: .spanish)
         #expect(english != spanish)
         #expect(english.contains("80%"))
         #expect(spanish.contains("80%"))
-        #expect(try JSONEncoder().encode(event) == before)
+        #expect(try encoder.encode(event) == before)
         #expect(event.code == "native.limitConfirmed")
     }
 
