@@ -5,6 +5,20 @@ import os.log
 
 private let log = Logger(subsystem: "com.opendente.app", category: "Notifications")
 
+@MainActor
+protocol NotificationDelivering {
+    func add(_ request: UNNotificationRequest, completion: @escaping @MainActor (Error?) -> Void)
+}
+
+@MainActor
+private struct SystemNotificationDelivery: NotificationDelivering {
+    func add(_ request: UNNotificationRequest, completion: @escaping @MainActor (Error?) -> Void) {
+        UNUserNotificationCenter.current().add(request) { error in
+            Task { @MainActor in completion(error) }
+        }
+    }
+}
+
 /// Sends macOS notifications for key charging events.
 /// Anti-spam: blocks the same event from firing twice in a row.
 @MainActor
@@ -12,9 +26,13 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
 
     static let shared = NotificationService()
 
-    override init() {
+    private let sender: any NotificationDelivering
+    private var deliveryGeneration = 0
+
+    init(sender: (any NotificationDelivering)? = nil) {
+        self.sender = sender ?? SystemNotificationDelivery()
         super.init()
-        UNUserNotificationCenter.current().delegate = self
+        if sender == nil { UNUserNotificationCenter.current().delegate = self }
     }
 
     /// Show banner + play sound even when the app is frontmost.
@@ -72,27 +90,29 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         guard isEnabled(event, settings: settings) else { return }
         guard event != lastEvent else { return }
         lastEvent = event
+        deliveryGeneration += 1
+        let generation = deliveryGeneration
 
         let content = UNMutableNotificationContent()
         switch event {
         case .chargeLimitReached:
-            content.title = "Charge Limit Reached"
-            content.body = "Battery has reached your charge limit. Charging paused."
+            content.title = L10n.tr("Charge Limit Reached")
+            content.body = L10n.tr("Battery has reached your charge limit. Charging paused.")
         case .topUpComplete:
-            content.title = "Top Up Complete"
-            content.body = "Battery is fully charged at 100%."
+            content.title = L10n.tr("Top Up Complete")
+            content.body = L10n.tr("Battery is fully charged at 100%.")
         case .heatProtection:
-            content.title = "Heat Protection Active"
-            content.body = "Charging paused due to high battery temperature."
+            content.title = L10n.tr("Heat Protection Active")
+            content.body = L10n.tr("Charging paused due to high battery temperature.")
         case .dischargeComplete:
-            content.title = "Discharge Complete"
-            content.body = "Battery has discharged to your charge limit."
+            content.title = L10n.tr("Discharge Complete")
+            content.body = L10n.tr("Battery has discharged to your charge limit.")
         case .systemChargeLimitConflict:
-            content.title = "System Charge Limit Active"
-            content.body = "macOS Charge Limit is preventing charging. Lower it in System Settings > Battery."
+            content.title = L10n.tr("System Charge Limit Active")
+            content.body = L10n.tr("macOS Charge Limit is preventing charging. Raise it to your requested target or turn it off in System Settings > Battery.")
         case .inhibitFailed:
-            content.title = "Charging Control Failed"
-            content.body = "Unable to stop charging. Try unplugging and re-plugging the charger."
+            content.title = L10n.tr("Charging Control Failed")
+            content.body = L10n.tr("Unable to stop charging. Try unplugging and re-plugging the charger.")
         }
         content.sound = .default
 
@@ -101,15 +121,47 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request) { error in
+        sender.add(request) { [weak self] error in
             if let error {
                 log.error("Failed to deliver notification: \(error.localizedDescription, privacy: .public)")
+                // A failed delivery may be retried, but must not clear a later session's event.
+                if self?.deliveryGeneration == generation { self?.lastEvent = nil }
             }
         }
     }
 
     func clearLastEvent() {
+        deliveryGeneration += 1
         lastEvent = nil
+    }
+
+    func handleModeChange(from previous: ChargingMode, to mode: ChargingMode, settings: AppSettings,
+                          controlAvailable: Bool = true) {
+        guard controlAvailable, previous != mode else { return }
+        if mode == .charging || mode == .onBattery || mode == .discharging {
+            clearLastEvent()
+        }
+        switch (previous, mode) {
+        case (.charging, .paused), (.sailing, .paused): send(.chargeLimitReached, settings: settings)
+        case (_, .heatProtection): send(.heatProtection, settings: settings)
+        default: break
+        }
+    }
+
+    func handleChargingEvent(_ event: ChargingEvent, settings: AppSettings, controlAvailable: Bool = true) {
+        guard controlAvailable else { return }
+        switch event {
+        case .dischargeCompleted: send(.dischargeComplete, settings: settings)
+        case .topUpStarted: clearLastEvent()
+        }
+    }
+
+    func handleBatteryState(_ state: BatteryState, mode: ChargingMode, settings: AppSettings,
+                            controlAvailable: Bool = true) {
+        guard controlAvailable, state.hasValidBatteryReading else { return }
+        if mode == .topUp && state.effectivePercentage(useHardware: settings.useHardwareBatteryPercentage) >= 100 {
+            send(.topUpComplete, settings: settings)
+        }
     }
 
     private func isEnabled(_ event: Event, settings: AppSettings) -> Bool {

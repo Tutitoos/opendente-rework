@@ -1,6 +1,7 @@
 import XCTest
 @testable import OpenDente
 
+@MainActor
 final class BatteryStateTests: XCTestCase {
 
     // MARK: - Health Percentage
@@ -53,6 +54,37 @@ final class BatteryStateTests: XCTestCase {
     // MARK: - Power Source
 
     // MARK: - Effective Percentage
+
+    func testHealthPercentageRejectsInvalidCapacityPairs() {
+        for (full, design) in [(0, 5000), (-1, 5000), (5000, -1),
+                               (65535, 5000), (65535, 65535), (7000, 5000), (100, 100)] {
+            XCTAssertNil(capacityState(full: full, design: design).healthPercentage,
+                         "Invalid pair \(full)/\(design) should not become battery health")
+        }
+    }
+
+    func testRawRatioIsIndependentOfChargeAndNativeCondition() {
+        var full = capacityState(full: 5502, design: 5760, percentage: 100)
+        var empty = capacityState(full: 5502, design: 5760, percentage: 0)
+        full.systemMaximumCapacityPercentage = 100
+        full.batteryCondition = .normal
+        empty.systemMaximumCapacityPercentage = 78
+        empty.batteryCondition = .serviceRecommended
+        XCTAssertEqual(full.healthPercentage, empty.healthPercentage)
+        XCTAssertEqual(full.healthPercentage!, 95.520833, accuracy: 0.000001)
+        XCTAssertEqual(full.systemMaximumCapacityPercentage, 100)
+        XCTAssertEqual(empty.batteryCondition, .serviceRecommended)
+    }
+
+    func testUnknownHealthDoesNotClaimNormal() {
+        XCTAssertEqual(BatteryState.unknown.batteryCondition, .unknown)
+        XCTAssertNil(BatteryState.unknown.systemMaximumCapacityPercentage)
+        XCTAssertEqual(BatteryState.unknown.batteryConditionSource, .unavailable)
+        XCTAssertEqual(PopoverDetailItem.batteryHealth.displayName, "Capacity / Design")
+        XCTAssertFalse(BatteryState.unknown.hasValidBatteryReading)
+        XCTAssertEqual(BatteryState.unknown.statusBarText(effectivePercentage: 0, showPercentage: true,
+                                                         showTemperature: false, showPower: false), "—")
+    }
 
     func testEffectivePercentage_usesHardwareWhenEnabled() {
         let state = makeBatteryState(percentage: 78, hardwarePercentage: 81)
@@ -227,6 +259,15 @@ final class BatteryStateTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private func capacityState(full: Int, design: Int, percentage: Int = 50) -> BatteryState {
+        BatteryState(percentage: percentage, hardwarePercentage: nil, isCharging: false, isPluggedIn: false,
+                     currentCapacity: nil, maxCapacity: full, designCapacity: design, cycleCount: nil,
+                     temperature: nil, voltage: nil, amperage: nil,
+                     systemPower: nil, adapterPower: nil, adapterInfo: nil,
+                     batteryPower: nil, notChargingReason: nil, chargerInhibitReason: nil,
+                     timeToEmpty: nil, timeToFull: nil)
+    }
 
     private func makeAdapterInfo(name: String, watts: Int) -> AdapterInfo {
         AdapterInfo(

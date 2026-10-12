@@ -1,4 +1,5 @@
 import XCTest
+import UserNotifications
 @testable import OpenDente
 
 @MainActor
@@ -7,20 +8,23 @@ final class NotificationServiceTests: XCTestCase {
     private let suiteName = "com.opendente.tests.notifications"
     private var service: NotificationService!
     private var settings: AppSettings!
+    private var sender: RecordingNotificationSender!
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
-        service = NotificationService()
+        sender = RecordingNotificationSender()
+        service = NotificationService(sender: sender)
         settings = AppSettings(defaults: defaults)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         UserDefaults.standard.removePersistentDomain(forName: suiteName)
         service = nil
         settings = nil
-        super.tearDown()
+        sender = nil
+        try await super.tearDown()
     }
 
     // MARK: - Gating
@@ -49,10 +53,9 @@ final class NotificationServiceTests: XCTestCase {
         service.send(.chargeLimitReached, settings: settings)
         XCTAssertEqual(service.lastEvent, .chargeLimitReached)
 
-        // Second send of same event should be blocked (lastEvent stays, but no new notification)
-        // We verify by checking lastEvent is still the same (idempotent)
         service.send(.chargeLimitReached, settings: settings)
         XCTAssertEqual(service.lastEvent, .chargeLimitReached)
+        XCTAssertEqual(sender.requests.count, 1)
     }
 
     func testSend_differentEvent_allowed() {
@@ -73,5 +76,18 @@ final class NotificationServiceTests: XCTestCase {
         // Same event should now be allowed again
         service.send(.chargeLimitReached, settings: settings)
         XCTAssertEqual(service.lastEvent, .chargeLimitReached)
+        XCTAssertEqual(sender.requests.count, 2)
+    }
+}
+
+@MainActor
+final class RecordingNotificationSender: NotificationDelivering {
+    var requests: [UNNotificationRequest] = []
+    var error: Error?
+    var defersDelivery = false
+    var completions: [@MainActor (Error?) -> Void] = []
+    func add(_ request: UNNotificationRequest, completion: @escaping @MainActor (Error?) -> Void) {
+        requests.append(request)
+        if defersDelivery { completions.append(completion) } else { completion(error) }
     }
 }

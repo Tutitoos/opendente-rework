@@ -64,28 +64,30 @@ struct SMCParamStruct {
 // MARK: - SMC Value Types
 
 /// Represents a value read from SMC
-struct SMCValue {
+struct SMCValue: Sendable {
     let key: String
     let dataSize: UInt32
     let dataType: String
     var bytes: [UInt8]
 
-    // NOTE: Apple Silicon SMC stores everything in native LITTLE-ENDIAN byte order
+    // Numeric convenience accessors decode native little-endian values. Individual
+    // key contracts still matter: legacy B0RM is big-endian, modern B0RM is not.
+    var trimmedDataType: String { dataType.trimmingCharacters(in: .whitespaces) }
 
     var uint8Value: UInt8? {
-        guard dataSize >= 1 else { return nil }
+        guard dataSize >= 1, bytes.count >= 1 else { return nil }
         return bytes[0]
     }
 
     var uint16Value: UInt16? {
-        guard dataSize >= 2 else { return nil }
+        guard dataSize >= 2, bytes.count >= 2 else { return nil }
         // Little-endian: LSB first (Apple Silicon SMC)
         return UInt16(bytes[1]) << 8 | UInt16(bytes[0])
     }
 
     /// Big-endian read for keys that use reverse byte order (e.g. B0RM)
     var uint16BigEndian: UInt16? {
-        guard dataSize >= 2 else { return nil }
+        guard dataSize >= 2, bytes.count >= 2 else { return nil }
         return UInt16(bytes[0]) << 8 | UInt16(bytes[1])
     }
 
@@ -95,7 +97,7 @@ struct SMCValue {
     }
 
     var uint32Value: UInt32? {
-        guard dataSize >= 4 else { return nil }
+        guard dataSize >= 4, bytes.count >= 4 else { return nil }
         return UInt32(bytes[3]) << 24 | UInt32(bytes[2]) << 16 |
                UInt32(bytes[1]) << 8  | UInt32(bytes[0])
     }
@@ -119,7 +121,7 @@ struct SMCValue {
 
     /// flt = 32-bit IEEE 754 float (little-endian on ARM)
     var floatValue: Float? {
-        guard dataSize >= 4 else { return nil }
+        guard dataSize >= 4, bytes.count >= 4 else { return nil }
         let bits = UInt32(bytes[0]) | UInt32(bytes[1]) << 8 |
                    UInt32(bytes[2]) << 16 | UInt32(bytes[3]) << 24
         return Float(bitPattern: bits)
@@ -134,7 +136,9 @@ enum SMCError: LocalizedError {
     case keyNotFound(String)
     case readFailed(String, UInt8)
     case writeFailed(String, UInt8)
+    case transportFailure(String, kern_return_t)
     case notConnected
+    case invalidDataSize(String, UInt32)
 
     var errorDescription: String? {
         switch self {
@@ -143,7 +147,9 @@ enum SMCError: LocalizedError {
         case .keyNotFound(let key):  return "SMC key not found: \(key)"
         case .readFailed(let key, let code): return "SMC read failed for \(key): result=\(code)"
         case .writeFailed(let key, let code): return "SMC write failed for \(key): result=\(code)"
+        case .transportFailure(let key, let code): return "SMC transport failed for \(key): kern_return=\(code)"
         case .notConnected:          return "SMC not connected"
+        case .invalidDataSize(let key, let size): return "Invalid SMC data size for \(key): \(size)"
         }
     }
 }
@@ -218,6 +224,7 @@ final class SMCService: @unchecked Sendable {
         guard dataSize > 0 else {
             throw SMCError.keyNotFound(key)
         }
+        guard dataSize <= 32 else { throw SMCError.invalidDataSize(key, dataSize) }
 
         // Step 2: Read the actual bytes
         var readInput = SMCParamStruct()
@@ -310,15 +317,26 @@ final class SMCService: @unchecked Sendable {
     /// Get key metadata (data type and size) for diagnostics.
     /// Returns nil if the key doesn't exist.
     func keyInfo(_ key: String) -> (type: String, size: UInt32)? {
+        try? keyInfoChecked(key)
+    }
+
+    /// Only a confirmed missing key returns nil. Recovery must not mistake a
+    /// transient transport/metadata failure for an unsupported optional control.
+    func keyInfoChecked(_ key: String) throws -> (type: String, size: UInt32)? {
         lock.lock()
         defer { lock.unlock() }
-        guard isOpen else { return nil }
+        guard isOpen else { throw SMCError.notConnected }
 
         var input = SMCParamStruct()
         input.key = fourCharCode(from: key)
         input.data8 = kSMCGetKeyInfo
-        guard let output = try? callSMC(input: input),
-              output.keyInfo.dataSize > 0 else { return nil }
+        let output: SMCParamStruct
+        do { output = try callSMC(input: input) }
+        catch SMCError.readFailed(_, 132) { return nil }
+        guard output.keyInfo.dataSize > 0 else { return nil }
+        guard output.keyInfo.dataSize <= 32 else {
+            throw SMCError.invalidDataSize(key, output.keyInfo.dataSize)
+        }
         return (fourCharString(from: output.keyInfo.dataType), output.keyInfo.dataSize)
     }
 
@@ -343,7 +361,7 @@ final class SMCService: @unchecked Sendable {
 
         if result != KERN_SUCCESS {
             smcLog.error("IOConnectCallStructMethod failed: kern_return=\(result, privacy: .public) (0x\(String(result, radix: 16), privacy: .public)) key=\(keyStr, privacy: .public) cmd=\(input.data8, privacy: .public)")
-            throw SMCError.readFailed(keyStr, UInt8(result & 0xFF))
+            throw SMCError.transportFailure(keyStr, result)
         }
 
         if outputData.result != 0 {

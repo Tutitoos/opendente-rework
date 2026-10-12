@@ -21,6 +21,7 @@ enum PowerFlowVisualState: Equatable {
 }
 
 struct PowerFlowView: View {
+    @ObservedObject private var language = LanguageManager.shared
     let battery: BatteryState
     var mode: ChargingMode = .idle
 
@@ -39,9 +40,9 @@ struct PowerFlowView: View {
 
         let bp = battery.batteryPower ?? 0
 
-        // Peak load: battery draining while plugged in (not inhibited modes where
-        // small negative readings are measurement noise, not real peak load)
-        if !battery.isCharging && bp < -0.1 && !isInhibited {
+        // Measured discharge can supplement the adapter even while charging is inhibited.
+        // The same noise threshold applies in every mode; the gate is not a power reading.
+        if bp < -0.1 {
             return .peakLoad
         }
 
@@ -99,7 +100,7 @@ struct PowerFlowView: View {
             case .pluggedInCharging:
                 pluggedInAdapterView {
                     flowBar(
-                        label: String(format: "%.1f W", battery.batteryPower ?? 0),
+                        label: L10n.format("%.1f W", battery.batteryPower ?? 0),
                         icon: "battery.100percent.bolt",
                         color: .green,
                         proportion: batteryProportion(battery.batteryPower ?? 0)
@@ -108,7 +109,7 @@ struct PowerFlowView: View {
             case .pluggedInTrickleCharging:
                 pluggedInAdapterView {
                     flowBar(
-                        label: "Charging",
+                        label: L10n.tr("Charging"),
                         icon: "battery.100percent.bolt",
                         color: .green,
                         proportion: 0.1
@@ -120,8 +121,8 @@ struct PowerFlowView: View {
                 pluggedInAdapterView {
                     let bp = battery.batteryPower ?? 0
                     let label = bp > 0.1
-                        ? String(format: "Stopping\u{2026} %.1f W", bp)
-                        : "Stopping\u{2026}"
+                        ? L10n.format("Stopping… %.1f W", bp)
+                        : L10n.tr("Stopping…")
                     flowBar(
                         label: label,
                         icon: "stop.circle",
@@ -132,7 +133,7 @@ struct PowerFlowView: View {
             case .pluggedInStarting:
                 pluggedInAdapterView {
                     flowBar(
-                        label: "Starting\u{2026}",
+                        label: L10n.tr("Starting…"),
                         icon: "battery.100percent.bolt",
                         color: .green,
                         proportion: 0.1
@@ -154,14 +155,14 @@ struct PowerFlowView: View {
             Image(systemName: battery.isPluggedIn ? "bolt.fill" : "battery.75percent")
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
-                Text(battery.isPluggedIn ? "Plugged In" : "On Battery")
+                Text(L10n.tr(battery.isPluggedIn ? "Plugged In" : "On Battery"))
                     .font(.system(size: 11, weight: .medium))
-                Text("Power data requires SMC access")
+                Text(L10n.tr("Power data requires SMC access"))
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("\(battery.percentage)%")
+            Text(battery.hasValidBatteryReading ? "\(battery.percentage)%" : "—")
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
         }
     }
@@ -176,7 +177,7 @@ struct PowerFlowView: View {
             VStack(spacing: 4) {
                 if let systemPower = battery.systemPower, systemPower > 0.1 {
                     flowBar(
-                        label: String(format: "%.1f W", systemPower),
+                        label: L10n.format("%.1f W", systemPower),
                         icon: "laptopcomputer",
                         color: .blue,
                         proportion: systemProportion
@@ -204,7 +205,7 @@ struct PowerFlowView: View {
                 HStack(spacing: 0) {
                     sourceLabel(icon: "bolt.fill", label: adapterWattsText)
                     flowBar(
-                        label: String(format: "%.1f W", adapterPower),
+                        label: L10n.format("%.1f W", adapterPower),
                         icon: "laptopcomputer",
                         color: .blue,
                         proportion: adapterShare.clamped(to: 0.1...1.0)
@@ -216,7 +217,7 @@ struct PowerFlowView: View {
             HStack(spacing: 0) {
                 sourceLabel(icon: batterySourceIcon, label: nil)
                 flowBar(
-                    label: String(format: "%.1f W", batteryDrain),
+                    label: L10n.format("%.1f W", batteryDrain),
                     icon: "laptopcomputer",
                     color: .orange,
                     proportion: batteryShare.clamped(to: 0.1...1.0)
@@ -234,7 +235,7 @@ struct PowerFlowView: View {
             VStack(spacing: 4) {
                 if let systemPower = battery.systemPower, systemPower > 0.1 {
                     flowBar(
-                        label: String(format: "%.1f W", systemPower),
+                        label: L10n.format("%.1f W", systemPower),
                         icon: "laptopcomputer",
                         color: .orange,
                         proportion: 1.0
@@ -242,14 +243,14 @@ struct PowerFlowView: View {
                 } else if let bp = battery.batteryPower, abs(bp) > 0.1 {
                     // Fallback to battery power if system power unavailable
                     flowBar(
-                        label: String(format: "%.1f W", abs(bp)),
+                        label: L10n.format("%.1f W", abs(bp)),
                         icon: "laptopcomputer",
                         color: .orange,
                         proportion: 1.0
                     )
                 } else {
                     flowBar(
-                        label: "Discharging",
+                        label: L10n.tr("Discharging"),
                         icon: "laptopcomputer",
                         color: .orange,
                         proportion: 1.0
@@ -309,7 +310,7 @@ struct PowerFlowView: View {
 
     private var adapterWattsText: String {
         if let adapter = battery.adapterPower, adapter > 0.1 {
-            return String(format: "%.0fW", adapter)
+            return L10n.format("%.0fW", adapter)
         }
         return "AC"
     }

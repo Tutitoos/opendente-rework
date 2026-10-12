@@ -2,8 +2,360 @@ import Foundation
 import Combine
 import IOKit.ps
 import os.log
+import Darwin
 
 private let log = Logger(subsystem: "com.opendente.app", category: "BatteryService")
+
+/// The firmware contract, not each sample's magnitude, selects B0RM byte order.
+enum SMCRemainingCapacityFormat: Equatable {
+    case legacyBigEndian, modernLittleEndian, unknown
+
+    init(bcf0Size: UInt32?) {
+        switch bcf0Size {
+        case 4: self = .legacyBigEndian
+        case 1: self = .modernLittleEndian
+        default: self = .unknown
+        }
+    }
+}
+
+struct BatteryCapacitySnapshot: Equatable {
+    var current: Int?
+    var full: Int?
+    var design: Int?
+    var hardwarePercentage: Int?
+    var source: BatteryDataSource = .unavailable
+    var currentSource: BatteryDataSource = .unavailable
+    var quality: BatteryDataQuality = .unavailable
+    var unavailableReason: String?
+    var isEstimated = false
+}
+
+/// Pure parsers used by the polling path and regression fixtures alike.
+enum BatteryReadingParser {
+    static func unsigned16(_ value: SMCValue?) -> Int? {
+        guard let value, value.trimmedDataType == "ui16", value.dataSize == 2,
+              value.bytes.count == 2, let raw = value.uint16Value else { return nil }
+        return Int(raw)
+    }
+
+    static func remainingCapacity(_ value: SMCValue?, format: SMCRemainingCapacityFormat,
+                                  full: Int) -> Int? {
+        guard let value, value.trimmedDataType == "ui16", value.dataSize == 2,
+              value.bytes.count == 2, (1...20_000).contains(full) else { return nil }
+        let remaining: Int?
+        switch format {
+        case .legacyBigEndian: remaining = value.uint16BigEndian.map(Int.init)
+        case .modernLittleEndian: remaining = value.uint16Value.map(Int.init)
+        case .unknown: return nil // Do not guess a value that can control charging.
+        }
+        return remaining.flatMap { validRemaining($0, full: full) ? $0 : nil }
+    }
+
+    /// ui8 is verified on current firmware. Do not invent a ui16 scale/byte order.
+    static func hardwarePercentage(_ value: SMCValue?) -> Int? {
+        guard let value, value.trimmedDataType == "ui8", value.dataSize == 1,
+              value.bytes.count == 1, let raw = value.uint8Value, raw <= 100 else { return nil }
+        return Int(raw)
+    }
+
+    static func registryInteger(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let raw = number.doubleValue
+        guard raw.isFinite, raw.rounded() == raw, raw >= 0, raw <= 20_000 else { return nil }
+        return Int(raw)
+    }
+
+    static func validRemaining(_ remaining: Int, full: Int) -> Bool {
+        remaining >= 0 && (1...20_000).contains(full)
+            && Double(remaining) / Double(full) <= 1.1
+    }
+
+    private static func invalidPair(full: Int?, design: Int?) -> Bool {
+        guard let full, let design else { return false }
+        return !BatteryState.validCapacityPair(full: full, design: design)
+    }
+
+    static func resolveCapacities(full: SMCValue?, design: SMCValue?, remaining: SMCValue?,
+                                  format: SMCRemainingCapacityFormat, brsc: SMCValue?,
+                                  registry: [String: Any]?, normalizedPercentage: Int?) -> BatteryCapacitySnapshot {
+        var result = BatteryCapacitySnapshot()
+        let smcFull = unsigned16(full)
+        let smcDesign = unsigned16(design)
+        let registryFull = registryInteger(registry?["FullChargeCapacity"])
+        let registryDesign = registryInteger(registry?["DesignCapacity"])
+
+        // Select a complete pair in mAh. IOPS Max Capacity (usually 100%) is not a fallback.
+        if let smcFull, let smcDesign,
+           BatteryState.validCapacityPair(full: smcFull, design: smcDesign) {
+            result.full = smcFull; result.design = smcDesign; result.source = .smc
+        } else if let registryFull, let registryDesign,
+                  BatteryState.validCapacityPair(full: registryFull, design: registryDesign) {
+            result.full = registryFull; result.design = registryDesign; result.source = .ioRegistry
+        }
+
+        guard let selectedFull = result.full else {
+            let invalidSMC = (full != nil && smcFull == nil) || (design != nil && smcDesign == nil)
+                || invalidPair(full: smcFull, design: smcDesign)
+            let invalidRegistry = (registry?["FullChargeCapacity"] != nil && registryFull == nil)
+                || (registry?["DesignCapacity"] != nil && registryDesign == nil)
+                || invalidPair(full: registryFull, design: registryDesign)
+            result.quality = invalidSMC || invalidRegistry ? .invalid : .unavailable
+            result.unavailableReason = result.quality == .invalid
+                ? "No complete, coherent capacity pair in mAh"
+                : "Capacity sensors unavailable"
+            result.hardwarePercentage = hardwarePercentage(brsc)
+            return result
+        }
+        result.quality = .valid
+
+        if result.source == .smc,
+           let raw = remainingCapacity(remaining, format: format, full: selectedFull) {
+            result.current = raw; result.currentSource = .smc
+        } else if let raw = registryInteger(registry?["RemainingCapacity"]),
+                  validRemaining(raw, full: selectedFull) {
+            result.current = raw; result.currentSource = .ioRegistry
+        }
+
+        if let current = result.current {
+            result.hardwarePercentage = min(100, Int((Double(current) / Double(selectedFull) * 100).rounded()))
+        } else {
+            result.hardwarePercentage = hardwarePercentage(brsc)
+            if let normalizedPercentage, (0...100).contains(normalizedPercentage) {
+                result.current = selectedFull * normalizedPercentage / 100
+                result.currentSource = .estimated
+                result.isEstimated = true
+            }
+        }
+        return result
+    }
+}
+
+struct SystemBatteryHealth: Equatable, Sendable {
+    var condition: BatteryCondition = .unknown
+    var maximumCapacityPercentage: Int?
+    var source: BatteryDataSource = .unavailable
+}
+
+struct BatteryPowerSourceSnapshot: Equatable, Sendable {
+    var percentage: Int?
+    var isCharging = false
+    var isPluggedIn = false
+    var cycleCount: Int?
+    var timeToEmpty: Int?
+    var timeToFull: Int?
+    var systemHealth = SystemBatteryHealth()
+
+    var hasValidBatteryReading: Bool { percentage != nil }
+}
+
+/// IOPS includes UPS devices and can publish absent batteries. Only a present
+/// internal battery may supply the percentage and AC state used by the controller.
+enum IOPSBatteryParser {
+    private static func boolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
+    }
+
+    private static func integerNumber(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let raw = number.doubleValue
+        // IOPS documents these capacities as signed kCFNumberIntType values.
+        guard raw.isFinite, raw >= 0, raw <= Double(Int32.max), raw.rounded() == raw else { return nil }
+        return raw
+    }
+
+    private static func boundedInteger(_ value: Any?, maximum: Int) -> Int? {
+        guard let raw = integerNumber(value), raw <= Double(maximum) else { return nil }
+        return Int(raw)
+    }
+
+    static func parse(_ descriptions: [[String: Any]]) -> BatteryPowerSourceSnapshot {
+        for description in descriptions {
+            guard description[kIOPSTypeKey] as? String == kIOPSInternalBatteryType,
+                  boolean(description[kIOPSIsPresentKey]) == true,
+                  let current = integerNumber(description[kIOPSCurrentCapacityKey]),
+                  let maximum = integerNumber(description[kIOPSMaxCapacityKey]),
+                  maximum > 0, current <= maximum,
+                  let isCharging = boolean(description[kIOPSIsChargingKey]),
+                  let powerSource = description[kIOPSPowerSourceStateKey] as? String,
+                  powerSource == kIOPSACPowerValue || powerSource == kIOPSBatteryPowerValue else { continue }
+            return BatteryPowerSourceSnapshot(
+                percentage: Int((current / maximum * 100).rounded()),
+                isCharging: isCharging,
+                isPluggedIn: powerSource == kIOPSACPowerValue,
+                cycleCount: boundedInteger(description["CycleCount"], maximum: 10_000),
+                timeToEmpty: boundedInteger(description[kIOPSTimeToEmptyKey], maximum: 100_000),
+                timeToFull: boundedInteger(description[kIOPSTimeToFullChargeKey], maximum: 100_000),
+                systemHealth: SystemBatteryHealthParser.iops(description)
+            )
+        }
+        return BatteryPowerSourceSnapshot()
+    }
+}
+
+struct SystemBatteryHealthCache {
+    static let lifetime: TimeInterval = 600
+    private(set) var health: SystemBatteryHealth?
+    private(set) var updatedAt: Date?
+
+    mutating func record(_ health: SystemBatteryHealth?, at now: Date) {
+        self.health = health
+        updatedAt = health == nil ? nil : now
+    }
+
+    func value(at now: Date) -> SystemBatteryHealth? {
+        guard let updatedAt else { return nil }
+        let age = now.timeIntervalSince(updatedAt)
+        return age >= 0 && age < Self.lifetime ? health : nil
+    }
+}
+
+enum SystemBatteryHealthParser {
+    static func condition(_ value: Any?) -> BatteryCondition {
+        guard let string = value as? String else { return .unknown }
+        switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "normal", "good": return .normal
+        case "fair", "poor", "check battery", "permanent battery failure",
+             "service recommended", "service battery", "replace soon", "replace now":
+            return .serviceRecommended
+        default: return .unknown
+        }
+    }
+
+    static func iops(_ description: [String: Any]) -> SystemBatteryHealth {
+        var health = SystemBatteryHealth(source: .iops)
+        let failures = description["BatteryFailureModes"] as? [String] ?? []
+        if description["Internal Failure"] as? Bool == true || !failures.isEmpty {
+            health.condition = .serviceRecommended
+        } else {
+            health.condition = condition(description["BatteryHealthCondition"])
+            if health.condition == .unknown { health.condition = condition(description["BatteryHealth"]) }
+        }
+        // Max Capacity in this dictionary is state of charge, never native battery health.
+        return health
+    }
+
+    static func maximumCapacity(_ value: Any?) -> Int? {
+        let raw: Double?
+        if let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+            raw = number.doubleValue
+        } else if let string = value as? String {
+            var clean = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean.hasSuffix("%") {
+                clean.removeLast()
+                clean = clean.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard !clean.isEmpty, clean.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
+            raw = Double(clean)
+        } else {
+            raw = nil
+        }
+        guard let raw, raw.isFinite, raw.rounded() == raw, (0...100).contains(raw) else { return nil }
+        return Int(raw)
+    }
+
+    static func systemProfiler(_ data: Data) -> SystemBatteryHealth? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = root["SPPowerDataType"] as? [[String: Any]] else { return nil }
+        for entry in entries {
+            let info = (entry["battery_health_info"] ?? entry["sppower_battery_health_info"]) as? [String: Any]
+            guard let info else { continue }
+            let health = SystemBatteryHealth(
+                condition: condition(info["sppower_battery_health"]),
+                maximumCapacityPercentage: maximumCapacity(info["sppower_battery_health_maximum_capacity"]),
+                source: .systemProfiler
+            )
+            if health.condition != .unknown || health.maximumCapacityPercentage != nil { return health }
+        }
+        return nil
+    }
+}
+
+/// One owned subprocess, with cancellation and a real wall-clock deadline. The lock
+/// protects process publication against the timer/cancellation callback. File output
+/// avoids waiting for EOF if a subprocess descendant retains a pipe descriptor.
+final class SystemHealthCommandRunner: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        cancelled = true
+        if let process, process.isRunning {
+            // Kill only the command owned by this runner. SIGKILL also handles a
+            // collector that ignores SIGTERM; no wait for an unbounded grace period.
+            kill(process.processIdentifier, SIGKILL)
+        }
+    }
+
+    func run(executableURL: URL, arguments: [String], timeout: TimeInterval) -> Data? {
+        guard timeout > 0, timeout.isFinite else { return nil }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenDente-health-" + UUID().uuidString, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+        }
+        catch { return nil }
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outputURL = directory.appendingPathComponent("output.json")
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil,
+                                            attributes: [.posixPermissions: 0o600]),
+              let output = try? FileHandle(forWritingTo: outputURL) else { return nil }
+        defer { try? output.close() }
+
+        let command = Process()
+        command.executableURL = executableURL
+        command.arguments = arguments
+        command.standardOutput = output
+        command.standardError = FileHandle.nullDevice
+        lock.lock()
+        guard !cancelled else { lock.unlock(); return nil }
+        process = command
+        do { try command.run() } catch { process = nil; lock.unlock(); return nil }
+        lock.unlock()
+
+        let deadline = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        deadline.schedule(deadline: .now() + timeout)
+        deadline.setEventHandler { [weak self] in self?.cancel() }
+        deadline.resume()
+        command.waitUntilExit()
+        deadline.cancel()
+
+        lock.lock()
+        process = nil
+        let didCancel = cancelled
+        lock.unlock()
+        guard !didCancel, command.terminationStatus == 0,
+              let input = try? FileHandle(forReadingFrom: outputURL) else { return nil }
+        defer { try? input.close() }
+        // This tiny report is normally a few KB. Reject unexpectedly large output.
+        guard let data = try? input.read(upToCount: 1_048_577), data.count <= 1_048_576 else { return nil }
+        return data
+    }
+}
+
+/// A low-frequency fallback. The actor keeps blocking process work off MainActor.
+actor SystemBatteryHealthProvider {
+    static let shared = SystemBatteryHealthProvider()
+
+    func read() async -> SystemBatteryHealth? {
+        guard !Task.isCancelled else { return nil }
+        let runner = SystemHealthCommandRunner()
+        return await withTaskCancellationHandler {
+            guard let data = runner.run(executableURL: URL(fileURLWithPath: "/usr/sbin/system_profiler"),
+                                        arguments: ["-json", "-detailLevel", "mini", "-timeout", "5", "SPPowerDataType"],
+                                        timeout: 10), !Task.isCancelled else { return nil }
+            return SystemBatteryHealthParser.systemProfiler(data)
+        } onCancel: {
+            runner.cancel()
+        }
+    }
+}
 
 /// Monitors battery state using IOKit power source APIs + SMC for detailed data.
 /// Reading does not require root.
@@ -19,6 +371,12 @@ final class BatteryService: ObservableObject {
     private var runLoopSource: CFRunLoopSource?
     private let smc = SMCService.shared
     let settings: AppSettings
+    private var remainingCapacityFormat: SMCRemainingCapacityFormat = .unknown
+    private var running = false
+    private var systemHealthTask: Task<Void, Never>?
+    private var lastSystemHealthRequest: Date?
+    private var systemHealthCache = SystemBatteryHealthCache()
+    private let systemHealthReader: @Sendable () async -> SystemBatteryHealth?
     /// Whether the first IORegistry diagnostic dump has been logged (avoid spamming every 2s)
     private var didLogIORegistryDiag = false
     /// Last logged NotChargingReason — only log when it changes
@@ -28,21 +386,29 @@ final class BatteryService: ObservableObject {
     /// Last logged ChargerInhibitReason — only log when it changes
     private var lastLoggedInhibitReason: UInt64?
 
-    init(settings: AppSettings = .shared) {
+    init(settings: AppSettings = .shared,
+         systemHealthReader: @escaping @Sendable () async -> SystemBatteryHealth? = {
+             await SystemBatteryHealthProvider.shared.read()
+         }) {
         self.settings = settings
+        self.systemHealthReader = systemHealthReader
     }
 
     // MARK: - Lifecycle
 
     func start() {
+        guard !running else { return }
+        running = true
         // Open SMC connection (for temperature, power, detailed data)
         do {
             try smc.open()
             smcAvailable = true
+            remainingCapacityFormat = SMCRemainingCapacityFormat(bcf0Size: smc.keyInfo("BCF0")?.size)
             log.notice("SMC connected successfully")
         } catch {
             log.error("SMC not available: \(error.localizedDescription, privacy: .public)")
             smcAvailable = false
+            remainingCapacityFormat = .unknown
         }
 
         // Initial read
@@ -56,11 +422,19 @@ final class BatteryService: ObservableObject {
     }
 
     func stop() {
+        running = false
+        systemHealthTask?.cancel()
+        systemHealthTask = nil
+        systemHealthCache.record(nil, at: Date())
+        lastSystemHealthRequest = nil
         timer?.invalidate()
         timer = nil
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
         }
+        runLoopSource = nil
+        remainingCapacityFormat = .unknown
+        smcAvailable = false
         smc.close()
     }
 
@@ -70,28 +444,19 @@ final class BatteryService: ObservableObject {
     }
 
     func update() {
+        refreshSystemHealthIfNeeded()
         let ioKitState = readIOKitPowerSource()
         let smcState = smcAvailable ? readSMCData() : SMCData()
         let ioRegState = readIORegistryBattery()
-
-        // Hardware SoC: B0RM/B0FC gives the raw fuel gauge percentage.
-        // BUIC is "Battery UI Charge" — the smoothed value macOS shows, same as IOKit.
-        // BRSC is "Battery Remaining State of Charge" (ui16, high byte = %).
-        // We want the raw ratio for an independent reading.
-        let hwPercent: Int? = {
-            // Primary: raw capacity ratio from fuel gauge
-            if let rem = smcState.remainingCapacity,
-               let full = smcState.fullChargeCapacity,
-               full > 0, rem >= 0 {
-                let ratio = Double(rem) / Double(full)
-                if ratio <= 1.1 {
-                    return max(0, min(100, Int(round(ratio * 100.0))))
-                }
-            }
-            // Fallback: BRSC (if available)
-            if let brsc = smcState.brscPercentage { return brsc }
-            return nil
-        }()
+        let cachedSystemHealth = systemHealthCache.value(at: Date())
+        let capacities = BatteryReadingParser.resolveCapacities(
+            full: smcState.fullChargeCapacityValue, design: smcState.designCapacityValue,
+            remaining: smcState.remainingCapacityValue, format: remainingCapacityFormat,
+            brsc: smcState.brscValue, registry: ioRegState.batteryData,
+            normalizedPercentage: ioKitState.percentage
+        )
+        let condition: SystemBatteryHealth? = ioKitState.systemHealth.condition != .unknown
+            ? ioKitState.systemHealth : cachedSystemHealth
 
         // Always build AdapterInfo from IORegistry when available.
         // SMC VD0R/ID0R override negotiated voltage/current with live readings.
@@ -114,15 +479,16 @@ final class BatteryService: ObservableObject {
         }
 
         let state = BatteryState(
-            percentage: ioKitState.percentage,
-            hardwarePercentage: hwPercent,
+            percentage: ioKitState.percentage ?? 0,
+            hardwarePercentage: capacities.hardwarePercentage,
             isCharging: ioKitState.isCharging,
             isPluggedIn: ioKitState.isPluggedIn,
-            // B0RM for mAh display when available, otherwise estimate from B0FC
-            currentCapacity: smcState.remainingCapacity ?? smcState.fullChargeCapacity.map { $0 * ioKitState.percentage / 100 },
-            maxCapacity: smcState.fullChargeCapacity,
-            designCapacity: smcState.designCapacity,
-            cycleCount: smcState.cycleCount ?? ioKitState.cycleCount,
+            currentCapacity: capacities.current,
+            maxCapacity: capacities.full,
+            designCapacity: capacities.design,
+            cycleCount: smcState.cycleCount
+                ?? BatteryReadingParser.registryInteger(ioRegState.batteryData?["CycleCount"])
+                ?? ioKitState.cycleCount,
             temperature: smcState.temperature,
             voltage: smcState.voltage,
             amperage: smcState.amperage,
@@ -133,7 +499,18 @@ final class BatteryService: ObservableObject {
             notChargingReason: ioRegState.notChargingReason,
             chargerInhibitReason: ioRegState.chargerInhibitReason,
             timeToEmpty: ioKitState.timeToEmpty,
-            timeToFull: ioKitState.timeToFull
+            timeToFull: ioKitState.timeToFull,
+            hasValidBatteryReading: ioKitState.hasValidBatteryReading,
+            systemMaximumCapacityPercentage: cachedSystemHealth?.maximumCapacityPercentage,
+            batteryCondition: condition?.condition ?? .unknown,
+            batteryConditionSource: condition?.condition == .unknown ? .unavailable : condition?.source ?? .unavailable,
+            systemMaximumCapacitySource: cachedSystemHealth?.maximumCapacityPercentage == nil
+                ? .unavailable : .systemProfiler,
+            capacitySource: capacities.source,
+            currentCapacitySource: capacities.currentSource,
+            healthDataQuality: capacities.quality,
+            capacityUnavailableReason: capacities.unavailableReason,
+            isCurrentCapacityEstimated: capacities.isEstimated
         )
 
         batteryState = state
@@ -141,49 +518,15 @@ final class BatteryService: ObservableObject {
 
     // MARK: - IOKit Power Source (no root needed)
 
-    private struct IOKitData {
-        var percentage: Int = 0
-        var isCharging: Bool = false
-        var isPluggedIn: Bool = false
-        var currentCapacity: Int?
-        var maxCapacity: Int?
-        var designCapacity: Int?
-        var cycleCount: Int?
-        var timeToEmpty: Int?
-        var timeToFull: Int?
-    }
-
-    private func readIOKitPowerSource() -> IOKitData {
-        var data = IOKitData()
-
+    private func readIOKitPowerSource() -> BatteryPowerSourceSnapshot {
         guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [Any],
-              let first = sources.first,
-              let desc = IOPSGetPowerSourceDescription(snapshot, first as CFTypeRef)?.takeUnretainedValue() as? [String: Any]
-        else {
-            return data
+              let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [Any] else {
+            return BatteryPowerSourceSnapshot()
         }
-
-        data.percentage = desc[kIOPSCurrentCapacityKey] as? Int ?? 0
-        data.isCharging = desc[kIOPSIsChargingKey] as? Bool ?? false
-        data.maxCapacity = desc[kIOPSMaxCapacityKey] as? Int
-        data.designCapacity = desc[kIOPSDesignCapacityKey] as? Int
-
-        if let powerSource = desc[kIOPSPowerSourceStateKey] as? String {
-            data.isPluggedIn = (powerSource == kIOPSACPowerValue)
+        let descriptions = sources.compactMap { source in
+            IOPSGetPowerSourceDescription(snapshot, source as CFTypeRef)?.takeUnretainedValue() as? [String: Any]
         }
-
-        if let timeToEmpty = desc[kIOPSTimeToEmptyKey] as? Int, timeToEmpty >= 0 {
-            data.timeToEmpty = timeToEmpty
-        }
-        if let timeToFull = desc[kIOPSTimeToFullChargeKey] as? Int, timeToFull >= 0 {
-            data.timeToFull = timeToFull
-        }
-
-        // IOKit sometimes reports cycle count
-        data.cycleCount = desc["CycleCount"] as? Int
-
-        return data
+        return IOPSBatteryParser.parse(descriptions)
     }
 
     // MARK: - SMC Data (detailed, no root for reads)
@@ -199,10 +542,10 @@ final class BatteryService: ObservableObject {
         var batteryPower: Double?
         var cycleCount: Int?
         var buicPercentage: Int?        // BUIC: UI-smoothed SoC (same as macOS %)
-        var brscPercentage: Int?        // BRSC: Battery Remaining State of Charge
-        var remainingCapacity: Int?
-        var fullChargeCapacity: Int?
-        var designCapacity: Int?
+        var brscValue: SMCValue?
+        var remainingCapacityValue: SMCValue?
+        var fullChargeCapacityValue: SMCValue?
+        var designCapacityValue: SMCValue?
     }
 
     private func readSMCData() -> SMCData {
@@ -286,8 +629,8 @@ final class BatteryService: ObservableObject {
         }
 
         // Cycle count
-        if let raw = smc.readUInt16("B0CT") {
-            data.cycleCount = Int(raw)
+        if let raw = BatteryReadingParser.unsigned16(smc.readKeyOptional("B0CT")), raw < 10_000 {
+            data.cycleCount = raw
         }
 
         // BUIC: "Battery UI Charge" — smoothed percentage macOS shows to users.
@@ -296,45 +639,21 @@ final class BatteryService: ObservableObject {
             data.buicPercentage = Int(raw)
         }
 
-        // BRSC: "Battery Remaining State of Charge" — ui16, high byte = percentage.
-        // May not exist on all Apple Silicon models.
-        if let raw = smc.readUInt16("BRSC") {
-            let pct = Int(raw >> 8)
-            if pct >= 0 && pct <= 100 {
-                data.brscPercentage = pct
-            }
-        }
-
-        // Capacity
-        if let raw = smc.readUInt16("B0FC") {
-            data.fullChargeCapacity = Int(raw)
-        }
-        if let raw = smc.readUInt16("B0DC") {
-            data.designCapacity = Int(raw)
-        }
-
-        // B0RM uses big-endian byte order per Asahi Linux docs, but try both.
-        // Use whichever gives a plausible ratio against B0FC.
-        if let val = smc.readKeyOptional("B0RM"), let fc = data.fullChargeCapacity, fc > 0 {
-            let be = val.uint16BigEndian.map(Int.init) ?? -1
-            let le = val.uint16Value.map(Int.init) ?? -1
-            let beRatio = Double(be) / Double(fc)
-            let leRatio = Double(le) / Double(fc)
-            if be >= 0 && beRatio <= 1.1 {
-                data.remainingCapacity = be
-            } else if le >= 0 && leRatio <= 1.1 {
-                data.remainingCapacity = le
-            }
-        }
+        // Retain metadata for the shared strict parser. Unknown BRSC formats and
+        // unknown B0RM firmware contracts are not guessed into charging percentages.
+        data.brscValue = smc.readKeyOptional("BRSC")
+        data.fullChargeCapacityValue = smc.readKeyOptional("B0FC")
+        data.designCapacityValue = smc.readKeyOptional("B0DC")
+        data.remainingCapacityValue = smc.readKeyOptional("B0RM")
 
         return data
     }
 
     // MARK: - IORegistry (adapter details, not-charging reason)
 
-    private func readIORegistryBattery() -> (adapterInfo: AdapterInfo?, notChargingReason: UInt64?, chargerInhibitReason: UInt64?) {
+    private func readIORegistryBattery() -> (adapterInfo: AdapterInfo?, notChargingReason: UInt64?, chargerInhibitReason: UInt64?, batteryData: [String: Any]?) {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
-        guard service != IO_OBJECT_NULL else { return (nil, nil, nil) }
+        guard service != IO_OBJECT_NULL else { return (nil, nil, nil, nil) }
         defer { IOObjectRelease(service) }
 
         // Read only the keys we need — NOT CreateCFProperties which copies the entire 16KB+ dict
@@ -343,6 +662,17 @@ final class BatteryService: ObservableObject {
             .takeRetainedValue() as? [String: Any]
         let chargerDict = IORegistryEntryCreateCFProperty(service, "ChargerData" as CFString, kCFAllocatorDefault, 0)?
             .takeRetainedValue() as? [String: Any]
+        var batteryData = IORegistryEntryCreateCFProperty(service, "BatteryData" as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? [String: Any] ?? [:]
+        // These are raw mAh fields; CurrentCapacity/MaxCapacity can be normalized percentages.
+        for (target, fallback) in [("FullChargeCapacity", "AppleRawMaxCapacity"),
+                                   ("RemainingCapacity", "AppleRawCurrentCapacity"),
+                                   ("DesignCapacity", "DesignCapacity"), ("CycleCount", "CycleCount")] {
+            if batteryData[target] == nil {
+                batteryData[target] = IORegistryEntryCreateCFProperty(service, fallback as CFString, kCFAllocatorDefault, 0)?
+                    .takeRetainedValue()
+            }
+        }
 
         // Parse AdapterDetails
         var adapterInfo: AdapterInfo?
@@ -444,7 +774,7 @@ final class BatteryService: ObservableObject {
             }
         }
 
-        return (adapterInfo, notChargingReason, chargerInhibitReason)
+        return (adapterInfo, notChargingReason, chargerInhibitReason, batteryData)
     }
 
     // MARK: - Polling
@@ -453,6 +783,27 @@ final class BatteryService: ObservableObject {
     /// even on battery. A fixed interval keeps the status bar responsive and charging
     /// verification fast, with no measurable impact on battery life.
     static let pollingInterval: TimeInterval = 2
+    static let systemHealthRefreshInterval: TimeInterval = 300
+    static let systemHealthCacheLifetime: TimeInterval = SystemBatteryHealthCache.lifetime
+
+    private func refreshSystemHealthIfNeeded(now: Date = Date()) {
+        guard running, systemHealthTask == nil,
+              lastSystemHealthRequest.map({
+                  let age = now.timeIntervalSince($0)
+                  return age < 0 || age >= Self.systemHealthRefreshInterval
+              }) ?? true
+        else { return }
+        lastSystemHealthRequest = now
+        let reader = systemHealthReader
+        systemHealthTask = Task { [weak self, reader] in
+            let health = await reader()
+            guard !Task.isCancelled, let self, self.running else { return }
+            self.systemHealthTask = nil
+            // A failed refresh becomes unknown, rather than perpetuating cached Good.
+            self.systemHealthCache.record(health, at: Date())
+            self.update()
+        }
+    }
 
     private func scheduleTimer() {
         timer?.invalidate()

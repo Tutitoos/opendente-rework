@@ -13,6 +13,8 @@ enum DiagnosticExporter {
     /// Show save panel and write diagnostic report.
     static func exportWithSavePanel() {
         let panel = NSSavePanel()
+        panel.title = L10n.tr("Export Diagnostic Report")
+        panel.prompt = L10n.tr("Export")
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let timestamp = formatter.string(from: Date())
@@ -30,7 +32,7 @@ enum DiagnosticExporter {
         } catch {
             log.error("Failed to export diagnostic report: \(error.localizedDescription, privacy: .public)")
             let alert = NSAlert()
-            alert.messageText = "Export Failed"
+            alert.messageText = L10n.tr("Export Failed")
             alert.informativeText = error.localizedDescription
             alert.alertStyle = .warning
             alert.runModal()
@@ -62,6 +64,7 @@ enum DiagnosticExporter {
         r += "=== OpenDente Diagnostic Report ===\n"
         r += "Generated: \(iso.string(from: Date()))\n"
         r += "App Version: \(appVersion) (\(buildNumber))\n"
+        r += "Source Revision: \(Bundle.main.object(forInfoDictionaryKey: "OpenDenteGitRevision") as? String ?? "unknown")\n"
         r += "Helper Version: \(ChargingManager.shared.helperVersion ?? "unknown")\n"
         r += "macOS: \(osStr)\n"
         r += "Model: \(model)\n"
@@ -76,7 +79,18 @@ enum DiagnosticExporter {
 
         r += "=== Current State ===\n"
         r += "Mode: \(charging.mode.displayName)\n"
-        r += "Charge Limit: \(settings.chargeLimit)%\n"
+        r += "Requested Charge Limit: \(settings.chargeLimit)%\n"
+        r += "Charge Limit Control Available: \(charging.canControlChargeLimit ? "Yes" : "No")\n"
+        r += "SMC Controls Available: \(charging.supportsSMCControls ? "Yes" : "No")\n"
+        if charging.isUsingNativeChargeLimit {
+            r += "Charge Limit Backend: macOS Native (PowerUI)\n"
+            r += "Effective Native Charge Limit: \(charging.effectiveNativeChargeLimit.map { "\($0)%" } ?? "unavailable")\n"
+            r += "Available Native Charge Limits: \(charging.availableNativeChargeLimits.map { "\($0)%" }.joined(separator: ", "))\n"
+            r += "Native Charge Limit Error: \(charging.nativeChargeLimitError ?? "none")\n"
+            r += "Native limit persists during sleep and after quitting. Saved SMC-only settings below are inactive.\n"
+        } else {
+            r += "Charge Limit Backend: \(charging.supportsSMCControls ? "SMC" : "unavailable")\n"
+        }
 
         r += "Sailing: \(settings.sailingModeEnabled ? "on" : "off")"
         if settings.sailingModeEnabled {
@@ -90,13 +104,18 @@ enum DiagnosticExporter {
         }
         r += "\n"
 
-        r += "Battery: \(pct)%"
+        r += state.hasValidBatteryReading ? "Battery: \(pct)%" : "Battery: unavailable"
         if let temp = state.temperature {
             r += ", \(String(format: "%.1f", temp))°C"
         }
         r += ", \(state.isPluggedIn ? "plugged in" : "on battery")"
         r += ", \(state.isCharging ? "charging" : "not charging")"
         r += "\n"
+        r += "Full Capacity / Design: \(state.healthPercentage.map { String(format: "%.1f%%", $0) } ?? "unavailable") [\(state.capacitySource.displayName)]\n"
+        r += "macOS Maximum Capacity: \(state.systemMaximumCapacityPercentage.map { "\($0)%" } ?? "unavailable") [\(state.systemMaximumCapacitySource.displayName)]\n"
+        r += "Battery Condition: \(state.batteryCondition.displayName) [\(state.batteryConditionSource.displayName)]\n"
+        r += "Remaining Capacity: \(state.currentCapacity.map { "\($0) mAh" } ?? "unavailable") [\(state.currentCapacitySource.displayName)]; estimated=\(state.isCurrentCapacityEstimated)\n"
+        if let reason = state.capacityUnavailableReason { r += "Capacity Unavailable: \(reason)\n" }
 
         let apiName: String
         switch charging.chargingAPI {
@@ -104,7 +123,7 @@ enum DiagnosticExporter {
         case .legacy: apiName = "Legacy (CH0B/CH0C)"
         case .unknown: apiName = "Not detected"
         }
-        r += "Charging API: \(apiName)\n"
+        r += "SMC Charging API: \(apiName)\n"
         r += "Helper: \(HelperInstaller.statusDescription)\n"
         r += "SMC Available: \(battery.smcAvailable ? "Yes" : "No")\n"
 

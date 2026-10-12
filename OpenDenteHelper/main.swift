@@ -17,13 +17,18 @@ nonisolated(unsafe) var delegate: HelperDelegate!
 nonisolated(unsafe) var watchdog: Watchdog!
 nonisolated(unsafe) var sleepRootPort: io_connect_t = 0
 
-watchdog = Watchdog { delegate.resetChargingDirect() }
+watchdog = Watchdog(needsRecovery: { delegate.requiresRecovery }) { _ = delegate.resetChargingDirect() }
 delegate = HelperDelegate(watchdog: watchdog)
+
+// Unsigned and ad-hoc builds may run hardware-free tests, but must never serve clients.
+let listener = NSXPCListener(machServiceName: HelperConstants.machServiceName)
+guard delegate.configureAuthorization(on: listener) else { exit(EXIT_FAILURE) }
+listener.delegate = delegate
 
 // MARK: - Crash Recovery (Layer 2)
 
 // If previous instance had charging inhibited (crash), reset immediately
-if HelperState.wasChargingInhibited() {
+if delegate.requiresRecovery {
     log.warning("Previous instance had charging inhibited — resetting to safe defaults")
     delegate.resetChargingDirect()
 }
@@ -66,8 +71,12 @@ func sleepWakeCallback(
     messageArgument: UnsafeMutableRawPointer?
 ) {
     switch messageType {
-    case 0xe0000240, // kIOMessageCanSystemSleep (idle sleep)
-         0xe0000280: // kIOMessageSystemWillSleep (forced sleep)
+    case HelperPowerMessage.canSystemSleep.rawValue:
+        // This is permission to idle-sleep, not a committed transition. Another
+        // process may cancel it, so neither charging nor the watchdog changes yet.
+        IOAllowPowerChange(sleepRootPort, Int(bitPattern: messageArgument))
+
+    case HelperPowerMessage.systemWillSleep.rawValue:
         log.info("System will sleep — suspending watchdog")
         watchdog.suspend()
         // Defense-in-depth: inhibit charging if app synced the setting.
@@ -78,7 +87,7 @@ func sleepWakeCallback(
         let arg = Int(Int(bitPattern: messageArgument))
         IOAllowPowerChange(sleepRootPort, arg)
 
-    case 0xe0000300: // kIOMessageSystemHasPoweredOn
+    case HelperPowerMessage.systemHasPoweredOn.rawValue:
         log.info("System woke up — resuming watchdog")
         watchdog.resume()
 
@@ -98,8 +107,6 @@ if sleepRootPort == 0 {
 
 // MARK: - XPC Listener
 
-let listener = NSXPCListener(machServiceName: HelperConstants.machServiceName)
-listener.delegate = delegate
 listener.resume()
 log.info("XPC listener started on \(HelperConstants.machServiceName)")
 
