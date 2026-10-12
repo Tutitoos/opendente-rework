@@ -11,7 +11,6 @@ final class NotificationServiceTests: XCTestCase {
     private var sender: RecordingNotificationSender!
 
     override func setUp() async throws {
-        try await super.setUp()
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         sender = RecordingNotificationSender()
@@ -24,7 +23,6 @@ final class NotificationServiceTests: XCTestCase {
         service = nil
         settings = nil
         sender = nil
-        try await super.tearDown()
     }
 
     // MARK: - Gating

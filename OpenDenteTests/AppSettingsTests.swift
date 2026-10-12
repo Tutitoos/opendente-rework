@@ -8,7 +8,6 @@ final class AppSettingsTests: XCTestCase {
     private var settings: AppSettings!
 
     override func setUp() async throws {
-        try await super.setUp()
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         settings = AppSettings(defaults: defaults)
@@ -17,7 +16,6 @@ final class AppSettingsTests: XCTestCase {
     override func tearDown() async throws {
         UserDefaults.standard.removePersistentDomain(forName: suiteName)
         settings = nil
-        try await super.tearDown()
     }
 
     // MARK: - Charge Limit Validation
