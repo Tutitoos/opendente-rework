@@ -7,17 +7,15 @@ final class AppSettingsTests: XCTestCase {
     private let suiteName = "com.opendente.tests.settings"
     private var settings: AppSettings!
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         settings = AppSettings(defaults: defaults)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         UserDefaults.standard.removePersistentDomain(forName: suiteName)
         settings = nil
-        super.tearDown()
     }
 
     // MARK: - Charge Limit Validation

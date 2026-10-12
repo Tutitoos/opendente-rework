@@ -1,5 +1,37 @@
 import Foundation
 
+/// A capacity ratio and a system-reported condition are different measurements.
+enum BatteryCondition: String, Equatable, Sendable {
+    case normal, serviceRecommended, unknown
+
+    var displayName: String {
+        switch self {
+        case .normal: return "Normal"
+        case .serviceRecommended: return "Service Recommended"
+        case .unknown: return "Unknown"
+        }
+    }
+}
+
+enum BatteryDataSource: String, Equatable, Sendable {
+    case smc, ioRegistry, iops, systemProfiler, estimated, unavailable
+
+    var displayName: String {
+        switch self {
+        case .smc: return "SMC"
+        case .ioRegistry: return "IORegistry"
+        case .iops: return "IOPS"
+        case .systemProfiler: return "macOS System Information"
+        case .estimated: return "Estimated from macOS percentage"
+        case .unavailable: return "Unavailable"
+        }
+    }
+}
+
+enum BatteryDataQuality: String, Equatable, Sendable {
+    case valid, unavailable, invalid
+}
+
 // MARK: - Adapter Types
 
 struct USBPDProfile: Equatable {
@@ -59,10 +91,33 @@ struct BatteryState: Equatable {
     let timeToEmpty: Int?            // Minutes
     let timeToFull: Int?             // Minutes
 
+    // Defaults keep existing snapshot/test initializers source-compatible.
+    /// False when IOPS did not supply a present internal battery with valid charge data.
+    /// The Int percentage remains source-compatible; controllers must ignore it when false.
+    var hasValidBatteryReading: Bool = true
+    var systemMaximumCapacityPercentage: Int? = nil
+    var batteryCondition: BatteryCondition = .unknown
+    var batteryConditionSource: BatteryDataSource = .unavailable
+    var systemMaximumCapacitySource: BatteryDataSource = .unavailable
+    /// Source of FCC/design; remaining capacity can have a separate source.
+    var capacitySource: BatteryDataSource = .unavailable
+    var currentCapacitySource: BatteryDataSource = .unavailable
+    var healthDataQuality: BatteryDataQuality = .unavailable
+    var capacityUnavailableReason: String? = nil
+    var isCurrentCapacityEstimated: Bool = false
+
     // MARK: - Computed
     var healthPercentage: Double? {
-        guard let max = maxCapacity, let design = designCapacity, design > 0, max > 0 else { return nil }
+        guard let max = maxCapacity, let design = designCapacity,
+              Self.validCapacityPair(full: max, design: design) else { return nil }
         return Double(max) / Double(design) * 100.0
+    }
+
+    /// Generous sanity bounds for the supported laptop batteries, not a wear diagnosis.
+    /// A slightly above-design FCC is legitimate. Sentinel/unrelated-unit values are not.
+    static func validCapacityPair(full: Int, design: Int) -> Bool {
+        (500...20_000).contains(design) && (1...20_000).contains(full)
+            && Double(full) / Double(design) <= 1.2
     }
 
     /// Returns hardware percentage if enabled and available, otherwise macOS percentage
@@ -92,7 +147,7 @@ struct BatteryState: Equatable {
         showPower: Bool
     ) -> String {
         var parts: [String] = []
-        if showPercentage { parts.append("\(pct)%") }
+        if showPercentage { parts.append(hasValidBatteryReading ? "\(pct)%" : "—") }
         if showTemperature, let temp = temperature {
             parts.append(TemperatureDisplay.format(temp, fractionDigits: 0))
         }
@@ -108,7 +163,7 @@ struct BatteryState: Equatable {
         temperature: nil, voltage: nil, amperage: nil,
         systemPower: nil, adapterPower: nil, adapterInfo: nil,
         batteryPower: nil, notChargingReason: nil, chargerInhibitReason: nil,
-        timeToEmpty: nil, timeToFull: nil
+        timeToEmpty: nil, timeToFull: nil, hasValidBatteryReading: false
     )
 }
 
@@ -241,7 +296,7 @@ enum PopoverDetailItem: String, CaseIterable, Codable, Identifiable {
     var displayName: String {
         switch self {
         case .temperature:         return "Temperature"
-        case .batteryHealth:       return "Battery Health"
+        case .batteryHealth:       return "Capacity / Design"
         case .cycleCount:          return "Cycle Count"
         case .timeRemaining:       return "Time Remaining"
         case .systemPower:         return "System Power"

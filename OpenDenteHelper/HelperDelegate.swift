@@ -1,479 +1,364 @@
 import Foundation
 import os.log
-import Security
 
 private let log = Logger(subsystem: HelperConstants.machServiceName, category: "Delegate")
 
-/// XPC listener delegate and protocol implementation.
-/// Verifies callers via code signing, performs SMC writes, manages state.
-final class HelperDelegate: NSObject, NSXPCListenerDelegate, HelperProtocol {
-
-    private let smc = SMCService.shared
-    private let watchdog: Watchdog
+/// The lock serializes XPC commands, disconnect recovery and power callbacks.
+final class HelperDelegate: NSObject, NSXPCListenerDelegate, HelperProtocol, @unchecked Sendable {
+    private let smc: any HelperSMC
+    private let watchdog: any HelperWatchdog
+    private let stateStore: any HelperStateStore
     private let lock = NSLock()
-
-    /// Detected charging API for this Mac
+    private let callerRequirement: String?
     private var chargingAPI: SMCChargingAPI = .unknown
-
-    /// Whether this Mac has a MagSafe LED controllable via ACLC
-    private var hasMagSafeLED = false
-
-    /// Whether any XPC client is currently connected (accessed under lock)
-    private var hasActiveClient = false
-
-    /// Synced from app — if true, helper inhibits charging independently on sleep.
-    /// Accessed under lock (written by XPC, read by IOKit sleep callback).
+    // Unknown optional capabilities must be attempted during restoration. Only a
+    // successful metadata query proving absence may suppress a default write.
+    private var hasMagSafeLED = true
+    private var hasLegacyCompanion = true
+    private var hasDischargeControl = true
+    private var recoveryRequired = false
+    // A durable override marker also represents valid inhibition/discharge.
+    // Only inherited state or a failed restoration needs retries while the
+    // owning app continues to send heartbeats.
+    private var pendingRecoveryRetry = false
+    private var lastResetHadCriticalFailure = false
+    private var activeClients: Set<UUID> = []
     private var stopChargingWhenSleeping = false
-
-    /// LED color to set when inhibiting charging on sleep (0xFF = don't touch LED).
-    /// Synced from app alongside stopChargingWhenSleeping.
     private var sleepLEDColor: UInt8 = 0xFF
 
-    init(watchdog: Watchdog) {
+    private enum ControlError: LocalizedError {
+        case unsupported, missingDischarge, invalidLED, verification(String)
+        var errorDescription: String? {
+            switch self {
+            case .unsupported: return "No charging API detected"
+            case .missingDischarge: return "No discharge control key detected"
+            case .invalidLED: return "Unsupported MagSafe LED color"
+            case .verification(let key): return "SMC readback did not confirm \(key)"
+            }
+        }
+    }
+
+    init(watchdog: any HelperWatchdog, smc: any HelperSMC = SMCService.shared,
+         stateStore: any HelperStateStore = HelperState.store) {
         self.watchdog = watchdog
+        self.smc = smc
+        self.stateStore = stateStore
+        callerRequirement = try? CallerAuthorization.currentHelperRequirement()
         super.init()
-        openSMC()
-        detectChargingAPI()
+        do { recoveryRequired = try stateStore.read() == .inhibited }
+        catch { recoveryRequired = true }
+        pendingRecoveryRetry = recoveryRequired
+        let failures = refreshCapabilitiesLocked()
+        for failure in failures { log.error("SMC detection failed: \(failure.message, privacy: .public)") }
     }
 
-    // MARK: - SMC Setup
+    var requiresRecovery: Bool { lock.withLock { recoveryRequired } }
 
-    private func openSMC() {
-        do {
-            try smc.open()
-            log.info("SMC connection opened")
-        } catch {
-            log.error("Failed to open SMC: \(error.localizedDescription, privacy: .public)")
-        }
+    private struct CapabilityFailure {
+        let key: String
+        let message: String
     }
 
-    private func detectChargingAPI() {
-        if smc.keyExists("CHTE") {
-            chargingAPI = .tahoe
-            log.info("Detected Tahoe charging API (CHTE/CHIE)")
-        } else if smc.keyExists("CH0B") {
-            chargingAPI = .legacy
-            log.info("Detected legacy charging API (CH0B/CH0C)")
-        } else {
-            chargingAPI = .unknown
-            log.info("No charging control keys detected")
-        }
-
-        // Check for MagSafe LED control (not all Macs have MagSafe)
-        hasMagSafeLED = smc.keyExists("ACLC")
-        log.info("MagSafe LED (ACLC): \(self.hasMagSafeLED ? "available" : "not found", privacy: .public)")
-
-        // Diagnostic: log all charging-related key availability with current values
-        let diagnosticKeys = ["CHTE", "CHIE", "CH0B", "CH0C", "CH0I", "CH0J", "ACLC"]
-        for key in diagnosticKeys {
-            if let info = smc.keyInfo(key) {
-                if let value = smc.readKeyOptional(key) {
-                    let hex = hexString(value.bytes)
-                    log.info("SMC key \(key, privacy: .public): type=\(info.type, privacy: .public) size=\(info.size, privacy: .public) value=[\(hex, privacy: .public)]")
-                } else {
-                    log.info("SMC key \(key, privacy: .public): type=\(info.type, privacy: .public) size=\(info.size, privacy: .public) value=<unreadable>")
-                }
-            } else {
-                log.info("SMC key \(key, privacy: .public): not found")
+    /// Optional metadata means genuinely absent. A thrown I/O/read error means
+    /// unknown, so retain any prior capability and never certify defaults from it.
+    /// Reopening and probing again also recovers from a transient startup failure.
+    private func refreshCapabilitiesLocked() -> [CapabilityFailure] {
+        do { try smc.open() }
+        catch { return [CapabilityFailure(key: "connection", message: error.localizedDescription)] }
+        var failures: [CapabilityFailure] = []
+        func exists(_ key: String) -> Bool? {
+            do { return try smc.keyInfoChecked(key) != nil }
+            catch {
+                failures.append(CapabilityFailure(key: key, message: "\(key): \(error.localizedDescription)"))
+                return nil
             }
         }
-    }
-
-    // MARK: - Verification
-
-    /// Format bytes array as hex string for logging (e.g. "01 00 00 00")
-    private func hexString(_ bytes: [UInt8]) -> String {
-        bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
-    }
-
-    /// Read back the charging key after a write to confirm it took effect.
-    /// `expected` = true means we expect charging to be inhibited.
-    private func verifyChargingKey(expected inhibited: Bool) {
-        switch chargingAPI {
-        case .legacy:
-            if let val = smc.readKeyOptional("CH0B") {
-                let allHex = hexString(val.bytes)
-                let byte = val.uint8Value ?? 0
-                let ok = inhibited ? (byte == 0x02) : (byte == 0x00)
-                if ok {
-                    log.info("CH0B readback OK: [\(allHex, privacy: .public)]")
-                } else {
-                    let expected = inhibited ? "02" : "00"
-                    log.error("CH0B readback MISMATCH: [\(allHex, privacy: .public)], expected [\(expected, privacy: .public)]")
-                }
-            } else {
-                log.warning("CH0B readback failed: key not readable")
-            }
-        case .tahoe:
-            if let val = smc.readKeyOptional("CHTE") {
-                let allHex = hexString(val.bytes)
-                let byte0 = val.uint8Value ?? 0xFF
-                let ok = inhibited ? (byte0 == 0x01) : (byte0 == 0x00)
-                if ok {
-                    log.info("CHTE readback OK: [\(allHex, privacy: .public)]")
-                } else {
-                    let expected = inhibited ? "01 00 00 00" : "00 00 00 00"
-                    log.error("CHTE readback MISMATCH: [\(allHex, privacy: .public)], expected [\(expected, privacy: .public)]")
-                }
-            } else {
-                log.warning("CHTE readback failed: key not readable")
-            }
-        case .unknown:
-            break
+        if let tahoe = exists("CHTE") {
+            if tahoe { chargingAPI = .tahoe }
+            else if let legacy = exists("CH0B") { chargingAPI = legacy ? .legacy : .unknown }
         }
+        if chargingAPI == .legacy, let companion = exists("CH0C") { hasLegacyCompanion = companion }
+        if chargingAPI != .unknown, let discharge = exists(dischargeKey) { hasDischargeControl = discharge }
+        if let led = exists("ACLC") { hasMagSafeLED = led }
+        return failures
     }
 
-    // MARK: - NSXPCListenerDelegate
+    /// LED availability and the discharge gate are independent of the charging gate.
+    /// A cosmetic metadata error must not prevent thermal inhibition.
+    private func chargingCapabilityFailures(_ failures: [CapabilityFailure]) -> [CapabilityFailure] {
+        failures.filter { $0.key != "ACLC" && $0.key != "CHIE" && $0.key != "CH0I" }
+    }
+
+    private func capabilityError(_ failures: [CapabilityFailure]) -> (Bool, String?) {
+        (false, failures.map(\.message).joined(separator: "; "))
+    }
+
+    /// Foundation rejects a mismatched sender before invoking the listener delegate.
+    /// The team comes from the helper's verified Apple certificate, never a build setting.
+    func configureAuthorization(on listener: NSXPCListener) -> Bool {
+        guard let callerRequirement else {
+            log.error("Refusing XPC service: helper must have a valid Apple-issued signature")
+            return false
+        }
+        listener.setConnectionCodeSigningRequirement(callerRequirement)
+        return true
+    }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
-        log.info("shouldAcceptNewConnection from pid \(connection.processIdentifier, privacy: .public)")
-
-        // Verify the caller is our app
-        guard verifyCaller(connection) else {
-            log.warning("REJECTED connection from pid \(connection.processIdentifier, privacy: .public)")
-            return false
-        }
-
+        guard let callerRequirement else { return false }
+        connection.setCodeSigningRequirement(callerRequirement)
         connection.exportedInterface = NSXPCInterface(with: HelperProtocol.self)
         connection.exportedObject = self
-
-        connection.invalidationHandler = { [weak self] in
-            log.info("XPC connection invalidated (app quit or crashed)")
-            self?.handleClientDisconnect()
-        }
-
-        connection.interruptionHandler = {
-            log.info("XPC connection interrupted (transient)")
-        }
-
+        let clientID = UUID()
+        connection.invalidationHandler = { [weak self] in self?.clientDisconnected(clientID) }
+        connection.interruptionHandler = { log.info("XPC client interrupted") }
+        clientConnected(clientID)
         connection.resume()
-        lock.lock()
-        hasActiveClient = true
-        lock.unlock()
         watchdog.receivedHeartbeat()
-        log.info("ACCEPTED connection from pid \(connection.processIdentifier, privacy: .public)")
         return true
     }
 
-    // MARK: - Caller Verification
+    // Internal lifecycle entry points also let tests exercise recovery without an XPC daemon.
+    func clientConnected(_ id: UUID) { lock.withLock { _ = activeClients.insert(id) } }
 
-    private func verifyCaller(_ connection: NSXPCConnection) -> Bool {
-        let pid = connection.processIdentifier
-
-        #if DEBUG
-        // In debug builds, skip SecCode verification — Xcode debug signing
-        // doesn't always pass identifier checks reliably.
-        log.debug("DEBUG: accepting connection from pid \(pid, privacy: .public) without SecCode check")
-        return true
-        #else
-        // Production: code signature verification
-        var code: SecCode?
-        let attrs = [kSecGuestAttributePid: pid] as CFDictionary
-        guard SecCodeCopyGuestWithAttributes(nil, attrs, [], &code) == errSecSuccess,
-              let secCode = code else {
-            log.error("Failed to get SecCode for pid \(pid, privacy: .public)")
-            return false
-        }
-
-        // For distribution, add team ID: and anchor apple generic and certificate leaf[subject.CN] = "Developer ID Application: ..."
-        let requirementStr = "identifier \"\(HelperConstants.appBundleID)\""
-        var requirement: SecRequirement?
-        guard SecRequirementCreateWithString(requirementStr as CFString, [], &requirement) == errSecSuccess,
-              let req = requirement else {
-            log.error("Failed to create security requirement")
-            return false
-        }
-
-        let result = SecCodeCheckValidity(secCode, [], req)
-        if result != errSecSuccess {
-            log.warning("Caller verification failed for pid \(pid, privacy: .public): \(result, privacy: .public)")
-            return false
-        }
-        return true
-        #endif
-    }
-
-    // MARK: - Client Disconnect
-
-    private func handleClientDisconnect() {
-        lock.lock()
-        let state = HelperState.read()
-        hasActiveClient = false
-        lock.unlock()
-
-        log.info("Client disconnected (last state: \(state?.rawValue ?? "none", privacy: .public))")
-
-        // If charging was inhibited when the app disconnected, reset immediately
-        if state == .inhibited {
-            log.warning("Client disconnected while charging inhibited — resetting to safe defaults")
-            resetChargingDirect()
+    func clientDisconnected(_ id: UUID) {
+        lock.withLock {
+            guard activeClients.remove(id) != nil, activeClients.isEmpty else { return }
+            clearSleepPolicyLocked()
+            watchdog.resume()
+            if recoveryRequired { _ = resetLocked() }
         }
     }
 
-    // MARK: - HelperProtocol
+    private func clearSleepPolicyLocked() {
+        stopChargingWhenSleeping = false
+        sleepLEDColor = 0xFF
+    }
+
+    /// Persist before *any* potentially unsafe write, including a cosmetic LED write.
+    private func prepareRecoveryLocked() throws {
+        recoveryRequired = true
+        try stateStore.write(.inhibited)
+    }
+
+    private func writeChecked(_ key: String, _ bytes: [UInt8]) throws {
+        try smc.writeKey(key, bytes: bytes)
+        guard let value = smc.readKeyOptional(key), value.bytes.count >= bytes.count,
+              Array(value.bytes.prefix(bytes.count)) == bytes else { throw ControlError.verification(key) }
+    }
+
+    private func chargingWrites(inhibited: Bool) throws -> [(String, [UInt8])] {
+        switch chargingAPI {
+        case .legacy:
+            let byte: UInt8 = inhibited ? 2 : 0
+            return [("CH0B", [byte])] + (hasLegacyCompanion ? [("CH0C", [byte])] : [])
+        case .tahoe: return [("CHTE", [inhibited ? 1 : 0, 0, 0, 0])]
+        case .unknown: throw ControlError.unsupported
+        }
+    }
+
+    private var dischargeKey: String { chargingAPI == .tahoe ? "CHIE" : "CH0I" }
+
+    private func failureLocked(_ error: Error, rollback: Bool) -> (Bool, String?) {
+        var message = error.localizedDescription
+        if rollback {
+            let restoration = resetLocked()
+            if let detail = restoration.1 { message += "; recovery: " + detail }
+        }
+        log.error("Control operation failed: \(message, privacy: .public)")
+        return (false, message)
+    }
+
+    /// A newly requested charging policy cannot adopt an inherited, uncertain
+    /// discharge gate. Complete its outstanding restoration first; only then
+    /// can a verified new override be treated as legitimate active control.
+    private func recoverBeforeNewPolicyLocked() -> (Bool, String?)? {
+        guard pendingRecoveryRetry else { return nil }
+        let restoration = resetLocked()
+        // A failed cosmetic restoration may keep its durable marker, but must
+        // not block a new thermal inhibition after charging/discharge recovery
+        // was verified. Critical failures still prohibit a new policy.
+        return restoration.0 || !lastResetHadCriticalFailure ? nil : restoration
+    }
+
+    private func inhibitLocked() -> (Bool, String?) {
+        if let failure = recoverBeforeNewPolicyLocked() { return failure }
+        let failures = chargingCapabilityFailures(refreshCapabilitiesLocked())
+        guard failures.isEmpty else { return capabilityError(failures) }
+        do {
+            let writes = try chargingWrites(inhibited: true)
+            // A persistence failure must not be followed by a hardware mutation.
+            try prepareRecoveryLocked()
+            do {
+                for (key, bytes) in writes { try writeChecked(key, bytes) }
+                // This is now an explicit, verified charging policy. A later
+                // heartbeat must not undo it as if it were a failed reset.
+                pendingRecoveryRetry = false
+                return (true, nil)
+            } catch { return failureLocked(error, rollback: true) }
+        } catch { return failureLocked(error, rollback: false) }
+    }
 
     func enableCharging(reply: @escaping (Bool, String?) -> Void) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard chargingAPI != .unknown else {
-            reply(false, "No charging API detected")
-            return
+        let result: (Bool, String?) = lock.withLock {
+            if let failure = recoverBeforeNewPolicyLocked() { return failure }
+            var failures = chargingCapabilityFailures(refreshCapabilitiesLocked()).map(\.message)
+            do {
+                for (key, bytes) in try chargingWrites(inhibited: false) {
+                    do { try writeChecked(key, bytes) }
+                    catch { failures.append(error.localizedDescription) }
+                }
+                guard failures.isEmpty else { return failureLocked(ControlError.verification(failures.joined(separator: "; ")), rollback: true) }
+                // Keep the recovery marker: discharge or LED overrides may still be active.
+                // Only a complete reset may declare all defaults restored.
+                pendingRecoveryRetry = false
+                return (true, nil)
+            } catch { return failureLocked(error, rollback: false) }
         }
-
-        do {
-            switch chargingAPI {
-            case .legacy:
-                log.info("Writing CH0B: [00], CH0C: [00]")
-                try smc.writeKey("CH0B", bytes: [0x00])
-                try smc.writeKey("CH0C", bytes: [0x00])
-            case .tahoe:
-                log.info("Writing CHTE: [00 00 00 00]")
-                try smc.writeKey("CHTE", bytes: [0x00, 0x00, 0x00, 0x00])
-            case .unknown:
-                break
-            }
-            verifyChargingKey(expected: false)
-            HelperState.write(.normal)
-            log.info("Charging enabled")
-            reply(true, nil)
-        } catch {
-            log.error("Failed to enable charging: \(error.localizedDescription, privacy: .public)")
-            reply(false, error.localizedDescription)
-        }
+        reply(result.0, result.1)
     }
 
     func inhibitCharging(reply: @escaping (Bool, String?) -> Void) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard chargingAPI != .unknown else {
-            reply(false, "No charging API detected")
-            return
-        }
-
-        do {
-            switch chargingAPI {
-            case .legacy:
-                log.info("Writing CH0B: [02], CH0C: [02]")
-                try smc.writeKey("CH0B", bytes: [0x02])
-                try smc.writeKey("CH0C", bytes: [0x02])
-            case .tahoe:
-                log.info("Writing CHTE: [01 00 00 00]")
-                try smc.writeKey("CHTE", bytes: [0x01, 0x00, 0x00, 0x00])
-            case .unknown:
-                break
-            }
-            // Read-back verification: confirm the write took effect
-            verifyChargingKey(expected: true)
-            HelperState.write(.inhibited)
-            log.info("Charging inhibited")
-            reply(true, nil)
-        } catch {
-            log.error("Failed to inhibit charging: \(error.localizedDescription, privacy: .public)")
-            reply(false, error.localizedDescription)
-        }
+        let result = lock.withLock { inhibitLocked() }
+        reply(result.0, result.1)
     }
 
     func forceDischarge(enable: Bool, reply: @escaping (Bool, String?) -> Void) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard chargingAPI != .unknown else {
-            reply(false, "No charging API detected")
-            return
-        }
-
-        do {
-            switch chargingAPI {
-            case .legacy:
-                let byte: UInt8 = enable ? 0x01 : 0x00
-                log.info("Writing CH0I: [\(self.hexString([byte]), privacy: .public)]")
-                try smc.writeKey("CH0I", bytes: [byte])
-            case .tahoe:
-                let byte: UInt8 = enable ? 0x08 : 0x00
-                log.info("Writing CHIE: [\(self.hexString([byte]), privacy: .public)]")
-                try smc.writeKey("CHIE", bytes: [byte])
-            case .unknown:
-                break
-            }
-            if enable {
-                // Enabling discharge — also inhibit charging
-                switch chargingAPI {
-                case .legacy:
-                    log.info("Writing CH0B: [02], CH0C: [02] (discharge + inhibit)")
-                    try smc.writeKey("CH0B", bytes: [0x02])
-                    try smc.writeKey("CH0C", bytes: [0x02])
-                case .tahoe:
-                    log.info("Writing CHTE: [01 00 00 00] (discharge + inhibit)")
-                    try smc.writeKey("CHTE", bytes: [0x01, 0x00, 0x00, 0x00])
-                case .unknown:
-                    break
+        let result: (Bool, String?) = lock.withLock {
+            if let failure = recoverBeforeNewPolicyLocked() { return failure }
+            let failures = refreshCapabilitiesLocked().filter { $0.key != "ACLC" }
+            guard failures.isEmpty else { return capabilityError(failures) }
+            guard chargingAPI != .unknown else { return (false, ControlError.unsupported.localizedDescription) }
+            guard hasDischargeControl else { return (false, ControlError.missingDischarge.localizedDescription) }
+            do {
+                if enable { try prepareRecoveryLocked() }
+            } catch { return failureLocked(error, rollback: false) }
+            do {
+                try writeChecked(dischargeKey, [enable ? (chargingAPI == .tahoe ? 8 : 1) : 0])
+                if enable {
+                    for (key, bytes) in try chargingWrites(inhibited: true) { try writeChecked(key, bytes) }
                 }
-                HelperState.write(.inhibited)
-            }
-            // Disabling discharge: only the discharge key is toggled (above).
-            // Charging keys are left as-is — ChargingManager's evaluateState
-            // sends enableCharging() or inhibitCharging() immediately after,
-            // avoiding a wasted enable→inhibit round-trip at the charge limit.
-            log.info("Force discharge: \(enable, privacy: .public)")
-            reply(true, nil)
-        } catch {
-            log.error("Failed to set discharge: \(error.localizedDescription, privacy: .public)")
-            reply(false, error.localizedDescription)
+                pendingRecoveryRetry = false
+                return (true, nil)
+            } catch { return failureLocked(error, rollback: true) }
         }
+        reply(result.0, result.1)
     }
 
     func resetToDefaults(reply: @escaping (Bool, String?) -> Void) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        resetChargingDirectLocked()
-        reply(true, nil)
+        let result = lock.withLock { resetLocked() }
+        reply(result.0, result.1)
     }
 
+    /// Attempt every independent restoration even when another key is unavailable or fails.
+    /// Never erase the durable marker or return success while any step remains unconfirmed.
+    private func resetLocked() -> (Bool, String?) {
+        clearSleepPolicyLocked()
+        watchdog.resume()
+        let detectionFailures = refreshCapabilitiesLocked()
+        var failures = detectionFailures.map(\.message)
+        var criticalFailure = detectionFailures.contains { $0.key != "ACLC" }
+        if hasDischargeControl {
+            do { try writeChecked(dischargeKey, [0]) }
+            catch { criticalFailure = true; failures.append(error.localizedDescription) }
+        }
+        do {
+            for (key, bytes) in try chargingWrites(inhibited: false) {
+                do { try writeChecked(key, bytes) }
+                catch { criticalFailure = true; failures.append(error.localizedDescription) }
+            }
+        } catch { criticalFailure = true; failures.append(error.localizedDescription) }
+        if hasMagSafeLED {
+            do { try writeChecked("ACLC", [HelperConstants.ledAuto]) }
+            catch { failures.append(error.localizedDescription) }
+        }
+        if failures.isEmpty {
+            do { try stateStore.write(.normal) }
+            catch { criticalFailure = true; failures.append(error.localizedDescription) }
+        }
+        lastResetHadCriticalFailure = criticalFailure
+        recoveryRequired = !failures.isEmpty
+        pendingRecoveryRetry = !failures.isEmpty
+        if failures.isEmpty { return (true, nil) }
+        let message = failures.joined(separator: "; ")
+        log.error("Defaults remain unconfirmed: \(message, privacy: .public)")
+        return (false, message)
+    }
+
+    @discardableResult
+    func resetChargingDirect() -> Bool { lock.withLock { resetLocked().0 } }
+
     func heartbeat(reply: @escaping (Bool) -> Void) {
+        lock.withLock {
+            if pendingRecoveryRetry { _ = resetLocked() }
+        }
         watchdog.receivedHeartbeat()
         reply(true)
     }
 
     func suspendWatchdog(reply: @escaping (Bool) -> Void) {
-        watchdog.suspend()
+        // Only an actual IOKit WillSleep notification may suspend crash recovery.
+        // Retain the protocol method for older apps whose pre-sleep request can be canceled.
         reply(true)
     }
 
-    func getVersion(reply: @escaping (String) -> Void) {
-        reply(HelperConstants.helperVersion)
-    }
-
+    func getVersion(reply: @escaping (String) -> Void) { reply(HelperConstants.helperVersion) }
     func getChargingAPI(reply: @escaping (String) -> Void) {
-        switch chargingAPI {
-        case .legacy:  reply("legacy")
-        case .tahoe:   reply("tahoe")
+        let api = lock.withLock { chargingAPI }
+        switch api {
+        case .legacy: reply("legacy")
+        case .tahoe: reply("tahoe")
         case .unknown: reply("unknown")
         }
     }
 
+    private func validLED(_ color: UInt8) -> Bool {
+        [HelperConstants.ledAuto, HelperConstants.ledOff, HelperConstants.ledGreen, HelperConstants.ledOrange].contains(color)
+    }
+
     func syncSleepSettings(stopChargingWhenSleeping: Bool, sleepLEDColor: UInt8, reply: @escaping (Bool) -> Void) {
-        lock.lock()
-        self.stopChargingWhenSleeping = stopChargingWhenSleeping
-        self.sleepLEDColor = sleepLEDColor
-        lock.unlock()
-        let hex = String(sleepLEDColor, radix: 16, uppercase: true)
-        log.info("Sleep settings synced: stopChargingWhenSleeping=\(stopChargingWhenSleeping, privacy: .public), sleepLED=0x\(hex, privacy: .public)")
-        reply(true)
+        let success = lock.withLock {
+            guard !activeClients.isEmpty, sleepLEDColor == 0xFF || validLED(sleepLEDColor) else { return false }
+            self.stopChargingWhenSleeping = stopChargingWhenSleeping
+            self.sleepLEDColor = sleepLEDColor
+            return true
+        }
+        reply(success)
     }
 
     func setMagSafeLED(color: UInt8, reply: @escaping (Bool, String?) -> Void) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard hasMagSafeLED else {
-            reply(false, "No MagSafe LED (ACLC key not found)")
-            return
+        let result: (Bool, String?) = lock.withLock {
+            do {
+                try smc.open()
+                hasMagSafeLED = try smc.keyInfoChecked("ACLC") != nil
+            } catch { return failureLocked(error, rollback: false) }
+            guard hasMagSafeLED else { return (false, "No MagSafe LED (ACLC key not found)") }
+            guard validLED(color) else { return (false, ControlError.invalidLED.localizedDescription) }
+            do {
+                if color != HelperConstants.ledAuto { try prepareRecoveryLocked() }
+            } catch { return failureLocked(error, rollback: false) }
+            do {
+                try writeChecked("ACLC", [color])
+                return (true, nil)
+            } catch {
+                // A cosmetic error must not undo an independently confirmed charging
+                // inhibition. Retain the marker for later full recovery instead.
+                return failureLocked(error, rollback: false)
+            }
         }
-
-        do {
-            try smc.writeKey("ACLC", bytes: [color])
-            let hex = String(color, radix: 16, uppercase: true)
-            log.info("MagSafe LED set to 0x\(hex, privacy: .public)")
-            reply(true, nil)
-        } catch {
-            log.error("Failed to set MagSafe LED: \(error.localizedDescription, privacy: .public)")
-            reply(false, error.localizedDescription)
-        }
+        reply(result.0, result.1)
     }
 
-    // MARK: - Sleep Defense-in-Depth
-
-    /// Called from IOKit sleep callback. If the app synced stopChargingWhenSleeping=true,
-    /// inhibit charging independently — backup in case app's XPC call didn't complete
-    /// before macOS suspended the app process.
     func inhibitChargingOnSleep() {
-        lock.lock()
-        let sleepSetting = stopChargingWhenSleeping
-        let api = chargingAPI
-        let ledColor = sleepLEDColor
-        let hasLED = hasMagSafeLED
-        lock.unlock()
-
-        guard sleepSetting && api != .unknown else {
-            log.info("Sleep callback: skipped (stopChargingWhenSleeping=\(sleepSetting, privacy: .public), api=\(String(describing: api), privacy: .public))")
-            return
-        }
-
-        lock.lock()
-        defer { lock.unlock() }
-
-        do {
-            switch chargingAPI {
-            case .legacy:
-                try smc.writeKey("CH0B", bytes: [0x02])
-                try smc.writeKey("CH0C", bytes: [0x02])
-            case .tahoe:
-                try smc.writeKey("CHTE", bytes: [0x01, 0x00, 0x00, 0x00])
-            case .unknown:
-                break
+        lock.withLock {
+            guard !activeClients.isEmpty, stopChargingWhenSleeping else { return }
+            let result = inhibitLocked()
+            guard result.0 else { return }
+            // The marker already reached disk, so an LED failure cannot hide inhibition.
+            if hasMagSafeLED, sleepLEDColor != 0xFF {
+                do { try writeChecked("ACLC", [sleepLEDColor]) }
+                catch { log.error("Sleep LED failed: \(error.localizedDescription, privacy: .public)") }
             }
-            // Update LED to reflect inhibited state (visible with lid closed).
-            // 0xFF = don't touch LED (controlMagSafeLED is off).
-            if hasLED && ledColor != 0xFF {
-                try smc.writeKey("ACLC", bytes: [ledColor])
-                let hex = String(ledColor, radix: 16, uppercase: true)
-                log.info("Sleep callback: LED set to 0x\(hex, privacy: .public)")
-            }
-            HelperState.write(.inhibited)
-            log.info("Sleep callback: inhibited charging (defense-in-depth)")
-        } catch {
-            log.error("Sleep callback: failed to inhibit charging: \(error.localizedDescription, privacy: .public)")
-        }
-    }
-
-    // MARK: - Direct Reset (for signal handlers and crash recovery)
-
-    /// Reset charging without going through XPC. Used by signal handlers and crash recovery.
-    /// Acquires its own lock.
-    func resetChargingDirect() {
-        lock.lock()
-        defer { lock.unlock() }
-        resetChargingDirectLocked()
-    }
-
-    /// Reset charging — caller must already hold lock
-    private func resetChargingDirectLocked() {
-        guard chargingAPI != .unknown else { return }
-
-        do {
-            // Stop discharge
-            switch chargingAPI {
-            case .legacy:
-                try smc.writeKey("CH0I", bytes: [0x00])
-            case .tahoe:
-                try smc.writeKey("CHIE", bytes: [0x00])
-            case .unknown:
-                break
-            }
-
-            // Enable charging
-            switch chargingAPI {
-            case .legacy:
-                try smc.writeKey("CH0B", bytes: [0x00])
-                try smc.writeKey("CH0C", bytes: [0x00])
-            case .tahoe:
-                try smc.writeKey("CHTE", bytes: [0x00, 0x00, 0x00, 0x00])
-            case .unknown:
-                break
-            }
-
-            // Reset MagSafe LED to system default if available
-            if hasMagSafeLED {
-                try smc.writeKey("ACLC", bytes: [HelperConstants.ledAuto])
-            }
-
-            HelperState.clear()
-            log.info("Reset to defaults (charging enabled, discharge off, LED default)")
-        } catch {
-            log.error("Failed to reset to defaults: \(error.localizedDescription, privacy: .public)")
         }
     }
 }

@@ -145,14 +145,16 @@ final class ChargingManagerTests: XCTestCase {
     private var settings: AppSettings!
     private var sleepMock: MockSleepAssertionControl!
 
-    override func setUp() {
-        super.setUp()
+    @MainActor
+    override func setUp() async throws {
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         settings = AppSettings(defaults: defaults)
         mock = MockChargingControl()
         sleepMock = MockSleepAssertionControl()
-        manager = ChargingManager(settings: settings, helper: mock, battery: .shared,
+        let battery = BatteryService(settings: settings)
+        battery.batteryState = makeBatteryState()
+        manager = ChargingManager(settings: settings, helper: mock, battery: battery,
                                   sleepAssertion: sleepMock)
         manager.chargingAPI = .legacy
         manager.isHelperInstalled = true
@@ -161,17 +163,18 @@ final class ChargingManagerTests: XCTestCase {
         settings.sailingModeEnabled = false
         settings.heatProtectionEnabled = false
         settings.controlMagSafeLED = false
+        settings.showNotifications = false
         settings.stopChargingWhenSleeping = false
         settings.disableSleepUntilChargeLimit = false
     }
 
-    override func tearDown() {
+    @MainActor
+    override func tearDown() async throws {
         UserDefaults.standard.removePersistentDomain(forName: suiteName)
         manager = nil
         mock = nil
         sleepMock = nil
         settings = nil
-        super.tearDown()
     }
 
     // =========================================================================
@@ -974,28 +977,15 @@ final class ChargingManagerTests: XCTestCase {
     // =========================================================================
     // MARK: - Helper Failure Handling
     // =========================================================================
-    // Note: mode is set optimistically BEFORE SMC write confirms.
-    // On failure, an async Task resets mode to .idle.
-    // This is intentional — XPC calls are async in production.
+    // A completed current failure resets intent. Delayed and stale replies are
+    // tested separately with a controllable asynchronous helper.
 
-    func testHelperFailure_modeSetOptimistically_thenResetsAsync() {
+    func testHelperFailure_currentReplyResetsMode() {
         mock.shouldFail = true
         manager.evaluateState(makeBatteryState(percentage: 80))
 
-        // Immediately after evaluateState, mode is set optimistically
-        XCTAssertEqual(manager.mode, .paused,
-            "Mode is set before SMC confirmation (optimistic)")
-
-        // The failure handler fires via Task — verify it runs
-        let expectation = expectation(description: "failure resets mode")
-        Task { @MainActor in
-            // Yield to let the failure Task run
-            try? await Task.sleep(for: .milliseconds(50))
-            XCTAssertEqual(self.manager.mode, .idle,
-                "After failure callback, mode should be reset to idle")
-            expectation.fulfill()
-        }
-        wait(for: [expectation], timeout: 1.0)
+        XCTAssertEqual(manager.mode, .idle,
+            "A current failure must take effect when its reply arrives")
     }
 
     // =========================================================================
@@ -1093,27 +1083,29 @@ final class ChargingManagerTests: XCTestCase {
     // =========================================================================
 
     func testStartupGuard_uninitializedData_staysIdle() {
-        // BatteryState.unknown: percentage=0, isPluggedIn=false, isCharging=false,
-        // timeToEmpty=nil, timeToFull=nil — all sentinel values
-        manager.evaluateState(.unknown)
+        var state = makeBatteryState(percentage: 0, isPluggedIn: false, temperature: nil)
+        state.hasValidBatteryReading = false
+        manager.evaluateState(state)
         XCTAssertEqual(manager.mode, .idle,
             "Uninitialized data must not change mode from .idle")
         XCTAssertTrue(mock.calls.isEmpty,
             "No SMC calls on uninitialized data")
     }
 
-    func testStartupGuard_zeroPercentWithTimeToEmpty_evaluatesNormally() {
-        // A Mac genuinely at 0% on battery would have timeToEmpty populated
+    func testStartupGuard_validZeroPercentOnBattery_evaluatesWithoutTimeEstimates() {
+        // CurrentCapacity=0 with valid internal-battery data is a real reading,
+        // even when IOKit omits its optional time estimates.
         let state = makeBatteryState(
-            percentage: 0, isPluggedIn: false, temperature: nil, timeToEmpty: 5
+            percentage: 0, isPluggedIn: false, temperature: nil
         )
         manager.evaluateState(state)
         XCTAssertEqual(manager.mode, .onBattery,
-            "Real zero-percent data with timeToEmpty should evaluate normally")
+            "A valid zero-percent battery reading must evaluate without time estimates")
+        XCTAssertTrue(mock.calls.isEmpty)
     }
 
     func testStartupGuard_pluggedInAtZero_evaluatesNormally() {
-        // isPluggedIn=true passes the guard even at 0%
+        // A valid 0% battery can begin charging.
         let state = makeBatteryState(percentage: 0, isPluggedIn: true)
         manager.evaluateState(state)
         XCTAssertEqual(manager.mode, .charging,

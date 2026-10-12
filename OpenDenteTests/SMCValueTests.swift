@@ -4,6 +4,7 @@ import XCTest
 /// Tests for SMCValue byte-to-value conversions.
 /// These are critical — wrong conversions mean wrong temperature/power readings,
 /// which could lead to incorrect charging decisions.
+@MainActor
 final class SMCValueTests: XCTestCase {
 
     // MARK: - sp78 (signed 7.8 fixed point, divide Int16 by 256)
@@ -191,6 +192,31 @@ final class SMCValueTests: XCTestCase {
         XCTAssertNil(val.uint16Value)
         XCTAssertNil(val.int16Value)
         XCTAssertNil(val.sp78Value)
+    }
+
+    func testMetadataCannotAllowReadingPastShortBuffer() {
+        let short = makeValue(dataType: "ui32", bytes: [0x80], dataSize: 4)
+        XCTAssertNil(short.uint16Value)
+        XCTAssertNil(short.uint16BigEndian)
+        XCTAssertNil(short.int16Value)
+        XCTAssertNil(short.sp78Value)
+        XCTAssertNil(short.sp96Value)
+        XCTAssertNil(short.uint32Value)
+        XCTAssertNil(short.int32Value)
+        XCTAssertNil(short.floatValue)
+        let empty = makeValue(dataType: "ui8 ", bytes: [], dataSize: 1)
+        XCTAssertNil(empty.uint8Value)
+    }
+
+    func testByteOrderAccessorsRemainExplicit() {
+        let value = makeValue(dataType: "ui16", bytes: [0x00, 0x12])
+        XCTAssertEqual(value.uint16Value, 4608)
+        XCTAssertEqual(value.uint16BigEndian, 18)
+    }
+
+    func testTrimmedDataTypePreservesSMCTypeContract() {
+        XCTAssertEqual(makeValue(dataType: "ui8 ", bytes: [76]).trimmedDataType, "ui8")
+        XCTAssertEqual(makeValue(dataType: "ui16", bytes: [0, 0]).trimmedDataType, "ui16")
     }
 
     // MARK: - Helpers

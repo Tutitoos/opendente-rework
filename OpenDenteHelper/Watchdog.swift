@@ -9,14 +9,17 @@ private let log = Logger(subsystem: HelperConstants.machServiceName, category: "
 /// The watchdog is suspended during system sleep to prevent false triggers.
 /// Primary crash detection is via NSXPCConnection.invalidationHandler (instant).
 /// This watchdog is a secondary backup.
-final class Watchdog: @unchecked Sendable {
+final class Watchdog: HelperWatchdog, @unchecked Sendable {
     private var timer: DispatchSourceTimer?
-    private var lastHeartbeat: Date = Date()
+    private var lastHeartbeat = DispatchTime.now()
     private var isSuspended = false
     private let queue = DispatchQueue(label: "com.opendente.helper.watchdog")
     private let resetAction: @Sendable () -> Void
+    private let needsRecovery: @Sendable () -> Bool
 
-    init(resetAction: @escaping @Sendable () -> Void) {
+    init(needsRecovery: @escaping @Sendable () -> Bool = { HelperState.wasChargingInhibited() },
+         resetAction: @escaping @Sendable () -> Void) {
+        self.needsRecovery = needsRecovery
         self.resetAction = resetAction
     }
 
@@ -40,7 +43,7 @@ final class Watchdog: @unchecked Sendable {
     /// Record a heartbeat from the app
     func receivedHeartbeat() {
         queue.async { [weak self] in
-            self?.lastHeartbeat = Date()
+            self?.lastHeartbeat = DispatchTime.now()
             log.debug("Heartbeat received")
         }
     }
@@ -60,7 +63,7 @@ final class Watchdog: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, self.isSuspended else { return }
             self.isSuspended = false
-            self.lastHeartbeat = Date() // Reset so we don't immediately fire
+            self.lastHeartbeat = DispatchTime.now() // Reset so we don't immediately fire
             self.timer?.resume()
             log.info("Watchdog resumed")
         }
@@ -75,6 +78,7 @@ final class Watchdog: @unchecked Sendable {
             }
             self.timer?.cancel()
             self.timer = nil
+            self.isSuspended = false
             log.info("Watchdog stopped")
         }
     }
@@ -82,6 +86,7 @@ final class Watchdog: @unchecked Sendable {
     // MARK: - Private
 
     private func startTimer() {
+        guard timer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(
             deadline: .now() + HelperConstants.watchdogCheckInterval,
@@ -92,18 +97,19 @@ final class Watchdog: @unchecked Sendable {
         }
         self.timer = timer
         timer.resume()
+        if isSuspended { timer.suspend() }
         log.info("Watchdog started (timeout: \(HelperConstants.watchdogTimeout, privacy: .public)s)")
     }
 
     private func check() {
-        let elapsed = Date().timeIntervalSince(lastHeartbeat)
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - lastHeartbeat.uptimeNanoseconds) / 1_000_000_000
 
         if elapsed > 60 {
             log.info("Heartbeat gap: \(Int(elapsed), privacy: .public)s since last heartbeat")
         }
 
         guard elapsed > HelperConstants.watchdogTimeout else { return }
-        guard HelperState.wasChargingInhibited() else {
+        guard needsRecovery() else {
             log.debug("Watchdog: timeout but charging not inhibited, ignoring")
             return
         }

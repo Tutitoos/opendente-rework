@@ -1,6 +1,7 @@
 import XCTest
 @testable import OpenDente
 
+@MainActor
 final class DisplayLogicTests: XCTestCase {
 
     // MARK: - formatMinutes

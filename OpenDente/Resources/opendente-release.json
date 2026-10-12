@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "appVersion": "0.2.0",
+  "helperVersion": "1.4.0",
+  "minimumCompatibleHelperVersion": "1.4.0",
+  "maximumExclusiveCompatibleHelperVersion": "2.0.0"
+}

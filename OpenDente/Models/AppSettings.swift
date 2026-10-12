@@ -134,6 +134,16 @@ final class AppSettings: ObservableObject {
 
     // MARK: - General
 
+    var languageSelection: LanguageSelection {
+        get {
+            defaults.string(forKey: "languageSelection").flatMap(LanguageSelection.init(rawValue:)) ?? .system
+        }
+        set {
+            objectWillChange.send()
+            defaults.set(newValue.rawValue, forKey: "languageSelection")
+        }
+    }
+
     var launchAtLogin: Bool {
         get { defaults.bool(forKey: "launchAtLogin") }
         set { objectWillChange.send(); defaults.set(newValue, forKey: "launchAtLogin") }

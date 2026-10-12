@@ -1,74 +1,120 @@
 import Foundation
-import os.log
+import Darwin
 
-private let log = Logger(subsystem: HelperConstants.machServiceName, category: "State")
-
-/// Atomic state file for crash recovery.
-/// On restart, the helper checks this file — if charging was inhibited when
-/// the helper last crashed/exited, it re-enables charging immediately.
+/// Persistent recovery marker. Missing means no previous mutation; unreadable/corrupt means
+/// recovery is required. A marker must reach disk before a potentially unsafe hardware write.
 enum HelperState {
-    private static let dir = HelperConstants.stateDirectory
-    private static let path = HelperConstants.stateFilePath
-
-    enum ChargingState: String {
-        case normal = "normal"
-        case inhibited = "inhibited"
+    enum ChargingState: String, Sendable {
+        case normal
+        case inhibited
     }
 
-    /// Ensure the state directory exists with root-only permissions (0700)
-    static func ensureDirectory() {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: dir) {
-            do {
-                try fm.createDirectory(
-                    atPath: dir,
-                    withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700]
-                )
-                log.info("Created state directory: \(dir, privacy: .public)")
-            } catch {
-                log.error("Failed to create state directory: \(error.localizedDescription, privacy: .public)")
+    static let store = FileHelperStateStore(directory: HelperConstants.stateDirectory)
+
+    static func wasChargingInhibited() -> Bool {
+        do { return try store.read() == .inhibited }
+        catch { return true }
+    }
+}
+
+struct FileHelperStateStore: HelperStateStore {
+    let directory: String
+    private var filename: String { "helper-state" }
+
+    enum StateError: LocalizedError {
+        case system(String, Int32)
+        case insecureDirectory
+        case corruptState
+
+        var errorDescription: String? {
+            switch self {
+            case .system(let operation, let code): return "State \(operation) failed: \(String(cString: strerror(code)))"
+            case .insecureDirectory: return "Recovery directory is not a real directory owned by the helper"
+            case .corruptState: return "Recovery state is corrupt"
             }
         }
-        // Always enforce permissions — createDirectory ignores attributes if dir exists,
-        // and a previous version or malicious process could have set wrong permissions.
-        do {
-            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
-        } catch {
-            log.error("Failed to enforce directory permissions: \(error.localizedDescription, privacy: .public)")
+    }
+
+    private func openDirectory(create: Bool) throws -> Int32 {
+        if create {
+            do {
+                try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+            } catch {
+                throw error
+            }
         }
-    }
-
-    /// Write the current charging state atomically
-    static func write(_ state: ChargingState) {
-        ensureDirectory()
-        do {
-            try state.rawValue.write(
-                toFile: path,
-                atomically: true,
-                encoding: .utf8
-            )
-            log.info("State written: \(state.rawValue, privacy: .public)")
-        } catch {
-            log.error("Failed to write state: \(error.localizedDescription, privacy: .public)")
+        var attributes = stat()
+        guard lstat(directory, &attributes) == 0 else { throw StateError.system("directory stat", errno) }
+        guard attributes.st_mode & S_IFMT == S_IFDIR, attributes.st_uid == geteuid() else {
+            throw StateError.insecureDirectory
         }
-    }
-
-    /// Read the last known charging state (returns nil if file doesn't exist)
-    static func read() -> ChargingState? {
-        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return nil
+        let fd = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw StateError.system("directory open", errno) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0, opened.st_mode & S_IFMT == S_IFDIR,
+              opened.st_uid == geteuid() else {
+            close(fd)
+            throw StateError.insecureDirectory
         }
-        return ChargingState(rawValue: contents.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard fchmod(fd, 0o700) == 0 else {
+            let code = errno
+            close(fd)
+            throw StateError.system("directory permissions", code)
+        }
+        return fd
     }
 
-    /// Check if the helper previously had charging inhibited (crash recovery)
-    static func wasChargingInhibited() -> Bool {
-        read() == .inhibited
+    func read() throws -> HelperState.ChargingState? {
+        let directoryFD: Int32
+        do { directoryFD = try openDirectory(create: false) }
+        catch StateError.system(_, let code) where code == ENOENT { return nil }
+        defer { close(directoryFD) }
+        let fd = openat(directoryFD, filename, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            if errno == ENOENT { return nil }
+            throw StateError.system("read open", errno)
+        }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw StateError.system("file stat", errno) }
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(), info.st_size <= 32 else {
+            throw StateError.corruptState
+        }
+        var bytes = [UInt8](repeating: 0, count: 33)
+        let count = bytes.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
+        guard count >= 0 else { throw StateError.system("read", errno) }
+        guard let text = String(bytes: bytes.prefix(count), encoding: .utf8),
+              let state = HelperState.ChargingState(rawValue: text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw StateError.corruptState
+        }
+        return state
     }
 
-    /// Clear the state file (set to normal)
-    static func clear() {
-        write(.normal)
+    func write(_ state: HelperState.ChargingState) throws {
+        let directoryFD = try openDirectory(create: true)
+        defer { close(directoryFD) }
+        let temporary = ".helper-state-\(UUID().uuidString)"
+        let fd = openat(directoryFD, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw StateError.system("write open", errno) }
+        defer {
+            close(fd)
+            unlinkat(directoryFD, temporary, 0)
+        }
+        let bytes = Array(state.rawValue.utf8)
+        try bytes.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let count = Darwin.write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else { throw StateError.system("write", errno) }
+                offset += count
+            }
+        }
+        guard fsync(fd) == 0 else { throw StateError.system("file sync", errno) }
+        guard renameat(directoryFD, temporary, directoryFD, filename) == 0 else {
+            throw StateError.system("atomic rename", errno)
+        }
+        guard fsync(directoryFD) == 0 else { throw StateError.system("directory sync", errno) }
     }
 }

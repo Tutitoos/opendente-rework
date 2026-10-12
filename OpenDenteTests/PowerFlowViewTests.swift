@@ -3,6 +3,7 @@ import XCTest
 
 /// Tests for PowerFlowView visual state logic.
 /// Ensures the display never lies — shows only measured data, never derived values.
+@MainActor
 final class PowerFlowViewTests: XCTestCase {
 
     // MARK: - Visual State: Charging
@@ -96,12 +97,10 @@ final class PowerFlowViewTests: XCTestCase {
         XCTAssertEqual(visual, .pluggedInStarting)
     }
 
-    func testPeakLoad_notTriggeredDuringInhibitedModes() {
-        // Battery draining while paused → not peak load, it's just paused state
-        // (battery may show small negative due to measurement noise)
+    func testPeakLoad_inhibitedModeDoesNotHideMeasuredDrain() {
         let state = makeState(isCharging: false, isPluggedIn: true, batteryPower: -0.5, systemPower: 14.0, adapterPower: 67.0)
         let visual = PowerFlowView.resolveVisualState(battery: state, mode: .paused)
-        XCTAssertEqual(visual, .pluggedInPaused)
+        XCTAssertEqual(visual, .peakLoad)
     }
 
     // MARK: - Visual State: On Battery
