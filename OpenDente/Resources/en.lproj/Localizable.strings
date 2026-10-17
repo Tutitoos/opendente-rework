@@ -63,7 +63,6 @@
 "Capacity (Estimated)" = "Capacity (Estimated)";
 "Capacity / Design" = "Capacity / Design";
 "Capacity Source" = "Capacity Source";
-"Capacity and Cycles · Daily Summary" = "Capacity and Cycles · Daily Summary";
 "Capacity data is unavailable." = "Capacity data is unavailable.";
 "Capacity sensors unavailable" = "Capacity sensors unavailable";
 "Category" = "Category";
@@ -224,7 +223,6 @@
 "Newer than Latest Release · %@" = "Newer than Latest Release · %@";
 "Next Full Charge" = "Next Full Charge";
 "No" = "No";
-"No Daily Capacity Readings Yet" = "No Daily Capacity Readings Yet";
 "No Events Recorded" = "No Events Recorded";
 "No Matching Events" = "No Matching Events";
 "No Official Release Published" = "No Official Release Published";
@@ -428,3 +426,13 @@
 "optimized charging retention is not a Boolean" = "optimized charging retention is not a Boolean";
 "optimized charging override permission is not a Boolean" = "optimized charging override permission is not a Boolean";
 "macOS did not return optimized charging retention." = "macOS did not return optimized charging retention.";
+"Low Power Mode" = "Low Power Mode";
+"External Power" = "External Power";
+"Plugged In, Not Charging" = "Plugged In, Not Charging";
+"Daily Readings" = "Daily Readings";
+"One-minute Averages" = "One-minute Averages";
+"Latest Reading" = "Latest Reading";
+"Selected Reading" = "Selected Reading";
+"No Reading Here" = "No Reading Here";
+"No Daily Readings Yet" = "No Daily Readings Yet";
+"Move the pointer over the chart to inspect a reading." = "Move the pointer over the chart to inspect a reading.";

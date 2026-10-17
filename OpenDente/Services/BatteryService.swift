@@ -369,6 +369,7 @@ final class BatteryService: ObservableObject {
 
     private var timer: Timer?
     private var runLoopSource: CFRunLoopSource?
+    private var powerStateObserver: AnyCancellable?
     private let smc = SMCService.shared
     let settings: AppSettings
     private var remainingCapacityFormat: SMCRemainingCapacityFormat = .unknown
@@ -399,6 +400,9 @@ final class BatteryService: ObservableObject {
     func start() {
         guard !running else { return }
         running = true
+        powerStateObserver = NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.update() }
         // Open SMC connection (for temperature, power, detailed data)
         do {
             try smc.open()
@@ -423,6 +427,8 @@ final class BatteryService: ObservableObject {
 
     func stop() {
         running = false
+        powerStateObserver?.cancel()
+        powerStateObserver = nil
         systemHealthTask?.cancel()
         systemHealthTask = nil
         systemHealthCache.record(nil, at: Date())
@@ -510,7 +516,8 @@ final class BatteryService: ObservableObject {
             currentCapacitySource: capacities.currentSource,
             healthDataQuality: capacities.quality,
             capacityUnavailableReason: capacities.unavailableReason,
-            isCurrentCapacityEstimated: capacities.isEstimated
+            isCurrentCapacityEstimated: capacities.isEstimated,
+            isLowPowerModeEnabled: ProcessInfo.processInfo.isLowPowerModeEnabled
         )
 
         batteryState = state

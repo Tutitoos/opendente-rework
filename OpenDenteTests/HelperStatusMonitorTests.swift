@@ -92,6 +92,26 @@ struct HelperStatusMonitorTests {
         monitor.stop()
     }
 
+    @Test func manualConnectionCheckRequestsRecoveryAndReportsFreshVersion() async {
+        let probe = HelperVersionProbeBox()
+        var recoveries = 0
+        let monitor = HelperStatusMonitor(bundledMetadata: metadata, registration: { .enabled },
+            versionProbe: { probe.capture($0) }, recoverConnection: { recoveries += 1 })
+        monitor.checkConnection()
+        #expect(recoveries == 1)
+        #expect(monitor.isRefreshing)
+        monitor.connectionRestored()
+        probe.reply(index: 1, version: "1.4.0")
+        await helperStatusDrain()
+        #expect(monitor.snapshot.connection == .responding)
+        #expect(monitor.snapshot.activeVersion == "1.4.0")
+        probe.reply(index: 0, version: "1.3.0")
+        await helperStatusDrain()
+        #expect(monitor.snapshot.activeVersion == "1.4.0")
+        monitor.stop()
+    }
+
+
     @Test func restoredConnectionReplacesAnyPendingProbe() async {
         let probe = HelperVersionProbeBox()
         let monitor = HelperStatusMonitor(bundledMetadata: metadata, registration: { .enabled },

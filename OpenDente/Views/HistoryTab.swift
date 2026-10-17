@@ -29,7 +29,7 @@ extension HistoryMetric {
         switch self {
         case .charge: .green
         case .temperature: .orange
-        case .batteryPower: .yellow
+        case .batteryPower: .teal
         case .adapterPower: .blue
         case .systemPower: .purple
         case .cycles: .secondary
@@ -53,6 +53,7 @@ struct HistoryTab: View {
     @ObservedObject private var preferences = LocalActivityPreferences.shared
     @State private var range = HistoryRange.day
     @State private var metric = HistoryMetric.charge
+    @State private var plotEnd = Date()
     @State private var snapshot = LocalHistorySnapshot(minutes: [], dailyHealth: [], damagedRecords: 0)
     @State private var loading = false
     @State private var error: String?
@@ -62,37 +63,35 @@ struct HistoryTab: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text(L10n.tr("Local History")).font(.title3.bold())
-                Text(L10n.tr("One-minute averages, stored only on this Mac. Gaps mean no usable reading; OpenDente does not reconstruct time while closed or asleep."))
-                    .font(.caption).foregroundStyle(.secondary)
-                HStack {
+                HStack(spacing: 12) {
                     Picker(L10n.tr("Range"), selection: $range) {
                         ForEach(HistoryRange.allCases) { Text($0.title).tag($0) }
-                    }.pickerStyle(.segmented)
+                    }.pickerStyle(.segmented).labelsHidden()
                     Picker(L10n.tr("Metric"), selection: $metric) {
                         ForEach(HistoryMetric.allCases) { Text($0.title).tag($0) }
                     }.labelsHidden().frame(maxWidth: 205)
                 }
-                GroupBox(metric.title + " (" + metric.unit + ")") {
-                    HistoryMetricChart(points: HistoryPlot.points(snapshot.minutes, metric: metric), metric: metric,
-                                       loading: loading)
+                GroupBox {
+                    HistoryChart(
+                        series: [HistoryChartSeries(metric: metric, points: HistoryPlot.points(snapshot.minutes, metric: metric, maximumPoints: .max))],
+                        interval: DateInterval(start: plotEnd.addingTimeInterval(-Double(range.rawValue) * 86_400), end: plotEnd),
+                        loading: loading
+                    ).padding(8)
                 }
-                GroupBox(L10n.tr("Capacity and Cycles · Daily Summary")) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text(L10n.tr("Up to 12 months. Each day keeps its last available readings; Apple capacity and OpenDente capacity/design remain separate measurements."))
-                            .font(.caption).foregroundStyle(.secondary)
-                        HistoryHealthChart(rows: snapshot.dailyHealth)
-                        Text(L10n.tr("Cycle Count")).font(.caption.weight(.medium))
-                        HistoryMetricChart(points: HistoryPlot.dailyPoints(snapshot.dailyHealth, metric: .cycles),
-                                           metric: .cycles, loading: false)
-                        if let last = snapshot.dailyHealth.last {
-                            HStack {
-                                Text(L10n.tr("Cycle Count"))
-                                Spacer()
-                                Text(last.cycleCount.map { L10n.number($0, fractionDigits: 0) } ?? "—")
-                            }.font(.caption)
-                        }
-                    }.padding(4)
+                Text(L10n.tr("One-minute averages, stored only on this Mac. Gaps mean no usable reading; OpenDente does not reconstruct time while closed or asleep."))
+                    .font(.caption).foregroundStyle(.secondary)
+                GroupBox {
+                    HistoryChart(series: [
+                        HistoryChartSeries(metric: .appleHealth, points: HistoryPlot.dailyPoints(snapshot.dailyHealth, metric: .appleHealth)),
+                        HistoryChartSeries(metric: .openDenteHealth, points: HistoryPlot.dailyPoints(snapshot.dailyHealth, metric: .openDenteHealth))
+                    ], isDaily: true).padding(8)
+                    Text(L10n.tr("Up to 12 months. Each day keeps its last available readings; Apple capacity and OpenDente capacity/design remain separate measurements."))
+                        .font(.caption).foregroundStyle(.secondary).padding(8)
+                }
+                GroupBox {
+                    HistoryChart(series: [
+                        HistoryChartSeries(metric: .cycles, points: HistoryPlot.dailyPoints(snapshot.dailyHealth, metric: .cycles))
+                    ], isDaily: true).padding(8)
                 }
                 if loading { ProgressView().controlSize(.small) }
                 if snapshot.damagedRecords > 0 {
@@ -139,11 +138,13 @@ struct HistoryTab: View {
         let id = UUID()
         requestID = id
         loading = true
-        let since = Date().addingTimeInterval(-Double(range.rawValue) * 86_400)
+        let end = Date()
+        let since = end.addingTimeInterval(-Double(range.rawValue) * 86_400)
         do {
             let value = try await recorder.store.history(since: since)
             guard requestID == id else { return }
             snapshot = value
+            plotEnd = end
             error = nil
         } catch {
             guard requestID == id else { return }
@@ -174,70 +175,5 @@ enum HistoryChartMarkers {
         var counts: [Int: Int] = [:]
         for point in points { counts[point.segment, default: 0] += 1 }
         return Set(counts.compactMap { $0.value == 1 ? $0.key : nil })
-    }
-}
-
-private struct HistoryMetricChart: View {
-    @ObservedObject private var language = LanguageManager.shared
-    let points: [HistoryPlotPoint]
-    let metric: HistoryMetric
-    let loading: Bool
-    var body: some View {
-        if points.isEmpty {
-            VStack(spacing: 6) {
-                Image(systemName: "chart.xyaxis.line").font(.title2)
-                Text(L10n.tr(loading ? "Loading History…" : "No Readings Available"))
-                if !loading { Text(L10n.tr("The first averaged reading appears after about one minute."))
-                    .font(.caption).foregroundStyle(.secondary) }
-            }.frame(maxWidth: .infinity).frame(height: 165)
-        } else {
-            let markerSegments = HistoryChartMarkers.segmentsRequiringMarkers(points)
-            Chart(points) { point in
-                LineMark(x: .value(L10n.tr("Time"), point.timestamp), y: .value(metric.unit, point.value),
-                         series: .value("segment", point.segment))
-                    .foregroundStyle(metric.color).interpolationMethod(.linear)
-                if markerSegments.contains(point.segment) {
-                    PointMark(x: .value(L10n.tr("Time"), point.timestamp), y: .value(metric.unit, point.value))
-                        .foregroundStyle(metric.color)
-                }
-            }
-            .chartXAxis { AxisMarks(values: .automatic(desiredCount: 4)) }
-            .chartYAxis { AxisMarks(values: .automatic(desiredCount: 4)) }
-            .chartLegend(.hidden)
-            .frame(height: 165).padding(8)
-            .accessibilityLabel(metric.title)
-        }
-    }
-}
-
-private struct HistoryHealthChart: View {
-    @ObservedObject private var language = LanguageManager.shared
-    let rows: [DailyBatteryHealth]
-    var body: some View {
-        let apple = HistoryPlot.dailyPoints(rows, metric: .appleHealth)
-        let openDente = HistoryPlot.dailyPoints(rows, metric: .openDenteHealth)
-        if apple.isEmpty && openDente.isEmpty {
-            Text(L10n.tr("No Daily Capacity Readings Yet")).foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity).frame(height: 105)
-        } else {
-            Chart {
-                ForEach(apple) { point in
-                    LineMark(x: .value(L10n.tr("Day"), point.timestamp), y: .value("%", point.value),
-                             series: .value("segment", "apple-\(point.segment)"))
-                        .foregroundStyle(.blue)
-                    PointMark(x: .value(L10n.tr("Day"), point.timestamp), y: .value("%", point.value)).foregroundStyle(.blue)
-                }
-                ForEach(openDente) { point in
-                    LineMark(x: .value(L10n.tr("Day"), point.timestamp), y: .value("%", point.value),
-                             series: .value("segment", "opendente-\(point.segment)"))
-                        .foregroundStyle(.green)
-                    PointMark(x: .value(L10n.tr("Day"), point.timestamp), y: .value("%", point.value)).foregroundStyle(.green)
-                }
-            }.chartLegend(.hidden).frame(height: 125)
-            HStack(spacing: 18) {
-                Label(L10n.tr("Apple Maximum Capacity"), systemImage: "circle.fill").foregroundStyle(.blue)
-                Label(L10n.tr("OpenDente Capacity / Design"), systemImage: "circle.fill").foregroundStyle(.green)
-            }.font(.caption)
-        }
     }
 }

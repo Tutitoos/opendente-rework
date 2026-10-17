@@ -33,6 +33,34 @@ struct LocalActivityTests {
         #expect(empty == nil)
     }
 
+    @Test func dailyHealthUsesLatestObservedValuesAndTimestamps() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        var accumulator = MinuteHistoryAccumulator()
+        _ = accumulator.add(.init(timestamp: date, values: [.cycles: 100, .appleHealth: 99]))
+        _ = accumulator.add(.init(timestamp: date.addingTimeInterval(30), values: [.cycles: 101, .appleHealth: 98]))
+        _ = accumulator.add(.init(timestamp: date.addingTimeInterval(59), values: [.charge: 80]))
+        let flushed = accumulator.flush()
+        let minute = try #require(flushed)
+
+        #expect(minute.value(.cycles) == 100.5)
+        #expect(minute.value(.appleHealth) == 98.5)
+        #expect(minute.lastObservedValue(.cycles) == 101)
+        #expect(minute.lastObservedValue(.appleHealth) == 98)
+        #expect(minute.metricLastObservedAt["cycles"] == date.addingTimeInterval(30))
+        #expect(minute.metricLastObservedAt["appleHealth"] == date.addingTimeInterval(30))
+
+        let store = LocalActivityStore(directory: folder)
+        try await store.append(minute, now: date.addingTimeInterval(60))
+        let snapshot = try await store.history(since: date.addingTimeInterval(-1), now: date.addingTimeInterval(120))
+        let daily = try #require(snapshot.dailyHealth.first)
+        #expect(daily.cycleCount == 101)
+        #expect(daily.applePercentage == 98)
+        #expect(daily.cyclesObservedAt == date.addingTimeInterval(30))
+        #expect(daily.appleObservedAt == date.addingTimeInterval(30))
+    }
+
     @Test func invalidChargeAndSensorsAreNotConvertedIntoZeroMeasurements() {
         var state = makeLocalActivityBattery()
         state.hasValidBatteryReading = false
@@ -96,6 +124,47 @@ struct LocalActivityTests {
         // A missing later health value retains its actual earlier observation timestamp.
         #expect(snapshot.dailyHealth.first?.appleObservedAt == date.addingTimeInterval(58))
         #expect(snapshot.damagedRecords == 0)
+    }
+
+    @Test func legacyMinuteJSONOpensAndDoesNotReplaceDailyLatestValuesWithAverages() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        let legacyJSON = Data("""
+        {
+          "schemaVersion": 1,
+          "sessionID": "00000000-0000-0000-0000-000000000001",
+          "timestamp": "2027-01-15T08:01:00Z",
+          "firstObservedAt": "2027-01-15T08:01:00Z",
+          "lastObservedAt": "2027-01-15T08:01:59Z",
+          "readingCount": 2,
+          "validChargeReadingCount": 0,
+          "averages": {"cycles": 100.5, "appleHealth": 98.5},
+          "valueCounts": {"cycles": 2, "appleHealth": 2},
+          "metricLastObservedAt": {
+            "cycles": "2027-01-15T08:01:58Z",
+            "appleHealth": "2027-01-15T08:01:58Z"
+          },
+          "sources": {},
+          "healthQualities": ["valid"]
+        }
+        """.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let legacy = try decoder.decode(BatteryHistoryMinute.self, from: legacyJSON)
+        #expect(legacy.latestValues == nil)
+
+        let store = LocalActivityStore(directory: folder)
+        try await store.append(activityMinute(date, values: [.cycles: 102, .appleHealth: 96]), now: date)
+        try await store.append(legacy, now: date.addingTimeInterval(120))
+        let snapshot = try await store.history(since: date.addingTimeInterval(-1), now: date.addingTimeInterval(120))
+        let daily = try #require(snapshot.dailyHealth.first)
+        #expect(snapshot.minutes.count == 2)
+        #expect(snapshot.damagedRecords == 0)
+        #expect(daily.cycleCount == 102)
+        #expect(daily.applePercentage == 96)
+        #expect(daily.cyclesObservedAt == date.addingTimeInterval(58))
+        #expect(daily.appleObservedAt == date.addingTimeInterval(58))
     }
 
     @Test func retentionKeepsDailyHealthAfterMinuteHistoryExpires() async throws {

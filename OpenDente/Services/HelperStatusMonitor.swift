@@ -139,6 +139,7 @@ final class HelperStatusMonitor: ObservableObject {
 
     private let registration: @MainActor () -> HelperRegistrationState
     private let versionProbe: @Sendable (@escaping @Sendable (String) -> Void) -> Void
+    private let recoverConnection: @MainActor () -> Void
     private let timeout: Duration
     private let releaseLookup: HelperReleaseLookup
     private var requestID: UUID?
@@ -150,9 +151,11 @@ final class HelperStatusMonitor: ObservableObject {
     init(bundledMetadata: HelperReleaseMetadata = .bundled,
          registration: @escaping @MainActor () -> HelperRegistrationState = { HelperRegistrationState(HelperInstaller.status) },
          versionProbe: @escaping @Sendable (@escaping @Sendable (String) -> Void) -> Void = { HelperClient.shared.getVersion(completion: $0) },
+         recoverConnection: @escaping @MainActor () -> Void = { HelperClient.shared.recoverConnectionIfNeeded() },
          timeout: Duration = .seconds(5), releaseLookup: HelperReleaseLookup = .init()) {
         self.bundledMetadata = bundledMetadata
         self.registration = registration
+        self.recoverConnection = recoverConnection
         self.versionProbe = versionProbe
         self.timeout = timeout
         self.releaseLookup = releaseLookup
@@ -214,6 +217,11 @@ final class HelperStatusMonitor: ObservableObject {
             events.send(.init(category: .helper, severity: .warning, code: "helper.unavailable",
                               values: ["reason": "connectionLost"]))
         }
+    }
+
+    func checkConnection() {
+        recoverConnection()
+        refresh()
     }
 
     func refresh() {

@@ -376,6 +376,40 @@ struct NativeChargingManagerTests {
         #expect(manager.setChargeLimit(90))
     }
 
+    @Test(arguments: [false, true])
+    func uncertainInhibitionIsReleasedBeforeNativeHandoff(timeout: Bool) {
+        let fixture = NativeManagerFixture()
+        defer { fixture.cleanUp() }
+        disableNativeFixtureLegacyExtras(fixture.settings)
+        let helper = NativeDeferredSMCControl()
+        let timer = NativeHandoffTimeout()
+        fixture.native.readError = NativeChargeLimitError.unavailable
+        let manager = ChargingManager(settings: fixture.settings, helper: helper, battery: fixture.battery,
+                                      sleepAssertion: fixture.sleep, controlTimeout: timer,
+                                      nativeChargeLimitControl: fixture.native)
+        manager.chargingAPI = .legacy
+        manager.isHelperInstalled = true
+        manager.evaluateState(makeBatteryState(percentage: 80))
+        #expect(helper.calls == [.inhibit])
+        if timeout { timer.fire() }
+        else { helper.reply(0, success: false) }
+
+        fixture.native.readError = nil
+        manager.refreshNativeChargeLimit()
+        #expect(helper.calls == [.inhibit, .enable])
+        #expect(manager.isReleasingSMCForNative)
+        #expect(!manager.canControlChargeLimit)
+        #expect(!manager.setChargeLimit(90))
+        helper.reply(0, success: true)
+        #expect(manager.isReleasingSMCForNative)
+        helper.reply(1, success: true)
+        #expect(!manager.isReleasingSMCForNative)
+        #expect(manager.canControlChargeLimit)
+        manager.refreshNativeChargeLimit()
+        #expect(helper.calls == [.inhibit, .enable])
+        #expect(fixture.native.writes.isEmpty)
+    }
+
     @Test func failedOwnSMCReleaseBlocksNativeWritesAndRetriesOnlyExplicitly() {
         let fixture = NativeManagerFixture()
         defer { fixture.cleanUp() }
@@ -511,6 +545,30 @@ struct NativeChargingManagerTests {
         #expect(fixture.manager.effectiveNativeChargeLimit == 100)
         #expect(fixture.manager.isNativeChargeLimitTemporarilyOverridden)
         #expect(fixture.settings.chargeLimit == 80)
+        #expect(fixture.native.writes.isEmpty)
+    }
+
+    @Test(arguments: [0, 80, 85, 100], [false, true])
+    func externalTemporaryPolicyPreservesHabitualLimit(storedLimit: Int, recoveryUnknown: Bool) async {
+        let fixture = NativeManagerFixture(savedLimit: 80)
+        defer { fixture.cleanUp() }
+        fixture.settings.monthlyChargeRecoveryUnknown = recoveryUnknown
+        fixture.native.snapshot = NativeChargeLimitSnapshot(availableLimits: [80, 85, 90, 95, 100],
+                                                           limit: storedLimit, enabled: false, nativeFeatureState: 3)
+        fixture.manager.start()
+        await drainNativeManagerRunLoop()
+        let expected = !recoveryUnknown && (80..<100).contains(storedLimit) ? storedLimit : 80
+        #expect(fixture.settings.chargeLimit == expected)
+        #expect(fixture.manager.effectiveNativeChargeLimit == 100)
+        #expect(fixture.manager.isNativeChargeLimitTemporarilyOverridden)
+        #expect(fixture.native.writes.isEmpty)
+
+        fixture.native.snapshot = nativeSnapshot(limit: 85)
+        fixture.manager.refreshNativeChargeLimit()
+        await drainNativeManagerRunLoop()
+        #expect(fixture.settings.chargeLimit == 85)
+        #expect(fixture.manager.effectiveNativeChargeLimit == 85)
+        #expect(!fixture.manager.isNativeChargeLimitTemporarilyOverridden)
         #expect(fixture.native.writes.isEmpty)
     }
 
@@ -697,4 +755,18 @@ private final class NativeDeferredSMCControl: ChargingControl, @unchecked Sendab
     func resetToDefaults(completion: (@Sendable (Bool, String?) -> Void)?) { record(.reset, completion: completion) }
     func setMagSafeLED(color: UInt8, completion: (@Sendable (Bool, String?) -> Void)?) { record(.led, completion: completion) }
     func resetToDefaultsSync(timeout: TimeInterval) { record(.terminationReset, completion: nil) }
+}
+
+@MainActor
+private final class NativeHandoffTimeout: ChargingOperationTimeoutControl {
+    private var action: (@MainActor @Sendable () -> Void)?
+    func schedule(after seconds: TimeInterval, action: @escaping @MainActor @Sendable () -> Void) {
+        self.action = action
+    }
+    func cancel() { action = nil }
+    func fire() {
+        let callback = action
+        action = nil
+        callback?()
+    }
 }

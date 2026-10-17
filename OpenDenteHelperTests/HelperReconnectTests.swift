@@ -26,6 +26,7 @@ private final class MockConnection: NSObject, HelperClientConnection, HelperProt
     private var interruption: (@Sendable () -> Void)?
     private var errorHandler: (@Sendable (Error) -> Void)?
     private var heartbeatReplies: [(Bool) -> Void] = []
+    private var invalidations = 0
     private var errorBeforeEnableReply = false
     var invalidationHandler: (@Sendable () -> Void)? {
         get { lock.withLock { invalidation } }
@@ -35,9 +36,13 @@ private final class MockConnection: NSObject, HelperClientConnection, HelperProt
         get { lock.withLock { interruption } }
         set { lock.withLock { interruption = newValue } }
     }
+    var invalidationCount: Int { lock.withLock { invalidations } }
     init(heartbeat: Heartbeat) { heartbeatMode = heartbeat }
     func resume() {}
-    func invalidate() { invalidationHandler?() }
+    func invalidate() {
+        let handler = lock.withLock { invalidations += 1; return invalidation }
+        handler?()
+    }
     func fireInvalidation() { invalidationHandler?() }
     func failEnableBeforeReply() { lock.withLock { errorBeforeEnableReply = true } }
     func completeHeartbeats(_ success: Bool) {
@@ -98,7 +103,7 @@ struct HelperReconnectTests {
         #expect(policy.nextDelay() == 1)
     }
 
-    @Test("F16: repeated rejected handshakes cannot reset the retry counter")
+    @Test("F16: automatic retries and explicit recovery remain bounded")
     func rejectedHandshakesHaveBoundedRetries() async throws {
         let factory = ReconnectFactory([.failure])
         let client = HelperClient(connectionFactory: { factory.make() }, reconnectDelays: [0, 0, 0, 0, 0], handshakeTimeout: 1)
@@ -111,7 +116,46 @@ struct HelperReconnectTests {
         for _ in 0..<10 { await Task.yield() }
         #expect(factory.connections.count == 6)
         #expect(restarts.values.isEmpty)
+        client.recoverConnectionIfNeeded()
+        #expect(try await waitUntil { factory.connections.count == 12 })
+        for _ in 0..<10 { await Task.yield() }
+        #expect(factory.connections.count == 12)
+        #expect(restarts.values.isEmpty)
     }
+
+    @Test("Explicit recovery reconnects after the bounded automatic budget is exhausted")
+    func recoversAfterAutomaticRetriesAreExhausted() async throws {
+        let factory = ReconnectFactory(Array(repeating: .failure, count: 6) + [.success])
+        let client = HelperClient(connectionFactory: { factory.make() }, reconnectDelays: [0, 0, 0, 0, 0], handshakeTimeout: 1)
+        defer { client.disconnect() }
+        let restarts = ResultCounter()
+        client.onHelperRestarted = { restarts.append(true) }
+        client.connect()
+        #expect(try await waitUntil { factory.connections.count == 6 })
+        for _ in 0..<10 { await Task.yield() }
+
+        client.recoverConnectionIfNeeded()
+        client.recoverConnectionIfNeeded()
+        #expect(try await waitUntil { restarts.values.count == 1 })
+        #expect(factory.connections.count == 7)
+        #expect(restarts.values == [true])
+    }
+
+    @Test("Explicit recovery does not invalidate a healthy connection")
+    func recoveryKeepsHealthyConnection() async throws {
+        let factory = ReconnectFactory([.success])
+        let client = HelperClient(connectionFactory: { factory.make() }, reconnectDelays: [0], handshakeTimeout: 1)
+        defer { client.disconnect() }
+        client.connect()
+        for _ in 0..<10 { await Task.yield() }
+
+        client.recoverConnectionIfNeeded()
+        client.recoverConnectionIfNeeded()
+        for _ in 0..<10 { await Task.yield() }
+        #expect(factory.connections.count == 1)
+        #expect(factory.connections[0].invalidationCount == 0)
+    }
+
 
     @Test("F16: a successful handshake restores the retry budget and emits resync once")
     func successfulHandshakeResetsBudget() async throws {
@@ -153,6 +197,8 @@ struct HelperReconnectTests {
         client.connect()
         factory.connections[0].fireInvalidation()
         client.disconnect()
+        for _ in 0..<10 { await Task.yield() }
+        client.recoverConnectionIfNeeded()
         for _ in 0..<10 { await Task.yield() }
         #expect(factory.connections.count == 1)
     }

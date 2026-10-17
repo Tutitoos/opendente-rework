@@ -51,13 +51,22 @@ actor LocalActivityStore {
         let day = Self.day(minute.timestamp)
         let key = Self.dayKey(day)
         let previous = try healthCache[key] ?? readHealth(at: day)
+        let appleValue = minute.lastObservedValue(.appleHealth)
+        let openDenteValue = minute.lastObservedValue(.openDenteHealth)
+        let cyclesValue = minute.lastObservedValue(.cycles)
+        let appleObservedAt = appleValue == nil ? previous?.appleObservedAt :
+            (minute.metricLastObservedAt["appleHealth"] ?? previous?.appleObservedAt)
+        let openDenteObservedAt = openDenteValue == nil ? previous?.openDenteObservedAt :
+            (minute.metricLastObservedAt["openDenteHealth"] ?? previous?.openDenteObservedAt)
+        let cyclesObservedAt = cyclesValue == nil ? previous?.cyclesObservedAt :
+            (minute.metricLastObservedAt["cycles"] ?? previous?.cyclesObservedAt)
         let summary = DailyBatteryHealth(day: day, lastObservedAt: minute.lastObservedAt,
-            applePercentage: minute.value(.appleHealth) ?? previous?.applePercentage,
-            openDentePercentage: minute.value(.openDenteHealth) ?? previous?.openDentePercentage,
-            cycleCount: minute.value(.cycles) ?? previous?.cycleCount,
-            appleObservedAt: minute.metricLastObservedAt["appleHealth"] ?? previous?.appleObservedAt,
-            openDenteObservedAt: minute.metricLastObservedAt["openDenteHealth"] ?? previous?.openDenteObservedAt,
-            cyclesObservedAt: minute.metricLastObservedAt["cycles"] ?? previous?.cyclesObservedAt,
+            applePercentage: appleValue ?? previous?.applePercentage,
+            openDentePercentage: openDenteValue ?? previous?.openDentePercentage,
+            cycleCount: cyclesValue ?? previous?.cycleCount,
+            appleObservedAt: appleObservedAt,
+            openDenteObservedAt: openDenteObservedAt,
+            cyclesObservedAt: cyclesObservedAt,
             sources: (previous?.sources ?? [:]).merging(minute.sources.filter {
                 ["appleHealth", "openDenteHealth", "cycles"].contains($0.key)
             }, uniquingKeysWith: { _, new in new }),

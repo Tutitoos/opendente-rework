@@ -57,7 +57,8 @@ struct HelperReconnectPolicy: Sendable {
         defer { attempts += 1 }
         return delays[attempts]
     }
-    mutating func handshakeSucceeded() { attempts = 0 }
+    mutating func reset() { attempts = 0 }
+    mutating func handshakeSucceeded() { reset() }
 }
 
 /// A proxy error and a reply can race. Each operation reports exactly one result.
@@ -93,6 +94,20 @@ final class HelperClient: @unchecked Sendable {
         self.connectionFactory = connectionFactory
         self.reconnectPolicy = HelperReconnectPolicy(delays: reconnectDelays)
         self.handshakeTimeout = handshakeTimeout
+    }
+
+    /// Reuses a healthy connection; when disconnected, starts one bounded recovery cycle immediately.
+    @MainActor func recoverConnectionIfNeeded() {
+        let (isConnected, isIntentional) = lock.withLock { (connection != nil, isIntentionalDisconnect) }
+        guard !isIntentional, handshakeWork == nil else { return }
+        if isConnected {
+            sendHeartbeat()
+            return
+        }
+        lock.withLock { reconnectPolicy.reset() }
+        reconnectWork?.cancel()
+        reconnectWork = nil
+        beginConnection(notifyRestart: true)
     }
 
     @MainActor func connect() { beginConnection(notifyRestart: false) }
@@ -182,7 +197,7 @@ final class HelperClient: @unchecked Sendable {
             guard let self else { return }
             let notify: Bool? = self.lock.withLock {
                 guard self.generation == id, self.connection != nil, !self.isIntentionalDisconnect else { return nil }
-                self.reconnectPolicy.handshakeSucceeded()
+                self.reconnectPolicy.reset()
                 let notify = self.pendingRestartNotification
                 self.pendingRestartNotification = false
                 return notify

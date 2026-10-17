@@ -153,7 +153,6 @@ struct EventLogTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(L10n.tr("Local Event Log")).font(.title3.bold())
             Text(L10n.tr("Changes, observed charging states and failures. Repeated identical states are omitted. Events are stored only on this Mac."))
                 .font(.caption).foregroundStyle(.secondary)
             HStack {

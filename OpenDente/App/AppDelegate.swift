@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
     private var lastIconName: String?
+    private var lastIconUsesLowPowerColor = false
     private var isTerminating = false
     private var terminationReplySent = false
     private var terminationDrain: Task<Void, Never>?
@@ -60,6 +61,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         charging.$mode
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusBarText() }
+            .store(in: &cancellables)
+
+        settings.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateStatusBarText() }
             .store(in: &cancellables)
@@ -197,22 +203,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem?.button else { return }
 
         let state = battery.batteryState
-        let pct = state.effectivePercentage(useHardware: settings.useHardwareBatteryPercentage)
 
         let displayedMode: ChargingMode = canControlCharging ? charging.mode : .idle
-        let iconName = !state.hasValidBatteryReading ? "battery.0percent" : settings.statusBarShowMode
-            ? displayedMode.batteryIconName(percentage: pct, isCharging: state.isCharging)
-            : ChargingMode.idle.batteryIconName(percentage: pct, isCharging: false)
-        if iconName != lastIconName {
-            let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
-            let description = state.hasValidBatteryReading ? L10n.format("Battery %d%%", pct) : L10n.tr("Battery reading unavailable")
-            button.image = NSImage(systemSymbolName: iconName, accessibilityDescription: description)?.withSymbolConfiguration(config)
-            lastIconName = iconName
+        let presentation = StatusBarBatteryPresentation(
+            state: state, mode: displayedMode,
+            useHardwarePercentage: settings.useHardwareBatteryPercentage,
+            showMode: settings.statusBarShowMode
+        )
+        if presentation.symbolName != lastIconName || presentation.usesLowPowerColor != lastIconUsesLowPowerColor {
+            button.image = presentation.makeImage()
+            lastIconName = presentation.symbolName
+            lastIconUsesLowPowerColor = presentation.usesLowPowerColor
         }
 
-        button.setAccessibilityLabel(state.hasValidBatteryReading
-            ? L10n.format("OpenDente: battery %d%%, %@", pct, L10n.tr(displayedMode.displayName))
-            : L10n.tr("Battery reading unavailable"))
+        button.setAccessibilityLabel(presentation.accessibilityLabel)
         let text = L10n.statusBarText(state, settings: settings)
         button.title = text.isEmpty ? "" : " " + text
     }
@@ -237,8 +241,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let window = NSWindow(contentViewController: NSHostingController(rootView: SettingsView()))
             window.title = L10n.tr("OpenDente Settings")
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-            window.setContentSize(NSSize(width: 680, height: 720))
-            window.contentMinSize = NSSize(width: 640, height: 460)
+            window.setContentSize(NSSize(width: 840, height: 660))
+            window.contentMinSize = NSSize(width: 760, height: 520)
             window.isReleasedWhenClosed = false
             window.center()
             settingsWindowController = NSWindowController(window: window)
@@ -360,7 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func didWake(_ notification: Notification) {
-        HelperClient.shared.sendHeartbeat()
+        if charging.isHelperInstalled { HelperClient.shared.recoverConnectionIfNeeded() }
         // Refresh battery state immediately — it may have changed during sleep
         // (e.g. charger unplugged, battery drained).
         battery.update()

@@ -2,48 +2,131 @@ import SwiftUI
 
 struct HelperStatusPanel: View {
     @ObservedObject private var language = LanguageManager.shared
-    @ObservedObject private var monitor = HelperStatusMonitor.shared
+    @ObservedObject var monitor = HelperStatusMonitor.shared
 
     var body: some View {
-        GroupBox(L10n.tr("Privileged Helper")) {
-            VStack(alignment: .leading, spacing: 9) {
-                row("Registration", registrationLabel, color: monitor.snapshot.registration == .enabled ? .green : .orange)
-                row("Connection", connectionLabel, color: monitor.snapshot.connection == .responding ? .green : .orange)
-                row("Running Version", monitor.snapshot.activeVersion ?? "—")
-                row("Included Version", monitor.bundledMetadata.helperVersion)
-                row("Compatible with This App", compatibilityLabel,
-                    color: monitor.snapshot.compatibility == .compatible ? .green : .orange)
-                Divider()
-                row("Latest Official Release", releaseLabel, color: releaseColor)
-                if let checked = monitor.snapshot.checkedAt {
-                    row("Last Connection Check", L10n.date(checked, includeTime: true))
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: connectionSymbol)
+                    .font(.title2)
+                    .foregroundStyle(connectionColor)
+                    .frame(width: 24)
+                    .padding(.top, 2)
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(connectionLabel)
+                        .font(.headline)
+                    Text(compatibilityLabel)
+                        .font(.callout)
+                        .foregroundStyle(compatibilityColor)
+                        .fixedSize(horizontal: false, vertical: true)
+
                 }
-                if let checked = monitor.latestCheckedAt {
-                    row("Last Release Check", L10n.date(checked, includeTime: true))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if let version = monitor.snapshot.activeVersion {
+                    Text(version)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.secondary.opacity(0.1), in: Capsule())
+                        .accessibilityLabel(L10n.tr("Running Version") + ": " + version)
                 }
-                Text(L10n.tr("Enabled means registered with macOS. A responding helper and a compatible running version are verified separately. The native charge limit works without this helper."))
-                    .font(.caption).foregroundStyle(.secondary)
-                if monitor.snapshot.failureCode == "timeout" {
+            }
+
+            if monitor.snapshot.failureCode == "timeout" {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .accessibilityHidden(true)
                     Text(L10n.tr("The helper did not reply within 5 seconds. Its running version is unknown."))
-                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                HStack {
-                    Button(L10n.tr("Check Connection")) { monitor.refresh() }.disabled(monitor.isRefreshing)
-                    Button(L10n.tr("Check for Updates")) { monitor.checkForUpdates() }
-                        .disabled(monitor.latest == .checking)
-                    if monitor.isRefreshing || monitor.latest == .checking { ProgressView().controlSize(.small) }
-                    Spacer()
-                    if case .verified(_, let url) = monitor.latest { Link(L10n.tr("Official Release"), destination: url) }
-                }.font(.caption)
-            }.padding(4)
-        }.task { monitor.refresh() }
+                .font(.callout)
+                .foregroundStyle(.orange)
+            }
+
+            Divider()
+
+            LabeledContent(L10n.tr("Registration"), value: registrationLabel)
+                .font(.callout)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L10n.tr("Latest Official Release"))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text(releaseLabel)
+                    .font(.body)
+                    .foregroundStyle(releaseColor)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+
+                if case .verified(_, let url) = monitor.latest {
+                    Link(L10n.tr("Official Release"), destination: url)
+                        .font(.callout)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button(L10n.tr("Check Connection")) { monitor.checkConnection() }
+                    .disabled(monitor.isRefreshing)
+                Button(L10n.tr("Check for Updates")) { monitor.checkForUpdates() }
+                    .disabled(monitor.latest == .checking)
+                if monitor.isRefreshing || monitor.latest == .checking {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .controlSize(.regular)
+
+            DisclosureGroup(L10n.tr("Technical Details")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    detailRow("Included Version", monitor.bundledMetadata.helperVersion)
+                    if let checked = monitor.snapshot.checkedAt {
+                        detailRow("Last Connection Check", L10n.date(checked, includeTime: true))
+                    }
+                    if let checked = monitor.latestCheckedAt {
+                        detailRow("Last Release Check", L10n.date(checked, includeTime: true))
+                    }
+                    Text(L10n.tr("Enabled means registered with macOS. A responding helper and a compatible running version are verified separately. The native charge limit works without this helper."))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 6)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .task { monitor.refresh() }
     }
-    private func row(_ title: String, _ value: String, color: Color = .primary) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(L10n.tr(title)).foregroundStyle(.secondary)
-            Spacer(minLength: 10)
-            Text(value).foregroundStyle(color).multilineTextAlignment(.trailing).textSelection(.enabled)
-        }.font(.callout)
+
+    private func detailRow(_ title: String, _ value: String) -> some View {
+        LabeledContent(L10n.tr(title)) {
+            Text(value)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+        }
+        .font(.callout)
+    }
+    private var connectionSymbol: String {
+        if monitor.isRefreshing { return "arrow.triangle.2.circlepath" }
+        return switch monitor.snapshot.connection {
+        case .unknown: "questionmark.circle"
+        case .responding: "checkmark.circle.fill"
+        case .notResponding: "exclamationmark.circle.fill"
+        }
+    }
+    private var connectionColor: Color {
+        if monitor.isRefreshing { return .secondary }
+        return switch monitor.snapshot.connection {
+        case .unknown: .secondary
+        case .responding: .green
+        case .notResponding: .red
+        }
+    }
+    private var compatibilityColor: Color {
+        monitor.snapshot.compatibility == .compatible ? .green : .orange
     }
     private var registrationLabel: String {
         switch monitor.snapshot.registration {

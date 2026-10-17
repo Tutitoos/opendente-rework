@@ -105,6 +105,7 @@ struct BatteryState: Equatable {
     var healthDataQuality: BatteryDataQuality = .unavailable
     var capacityUnavailableReason: String? = nil
     var isCurrentCapacityEstimated: Bool = false
+    var isLowPowerModeEnabled: Bool = false
 
     // MARK: - Computed
     var healthPercentage: Double? {
@@ -238,20 +239,6 @@ enum ChargingMode: String, CaseIterable {
 
         case .idle, .calibrating:
             return nil
-        }
-    }
-
-    /// SF Symbol name for the status bar battery icon
-    func batteryIconName(percentage: Int, isCharging: Bool) -> String {
-        if isCharging || self == .charging || self == .topUp {
-            return "battery.100percent.bolt"
-        }
-        switch percentage {
-        case 88...100: return "battery.100percent"
-        case 63..<88:  return "battery.75percent"
-        case 38..<63:  return "battery.50percent"
-        case 13..<38:  return "battery.25percent"
-        default:       return "battery.0percent"
         }
     }
 

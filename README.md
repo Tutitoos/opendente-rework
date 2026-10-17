@@ -34,9 +34,13 @@ OpenDente prefers `PowerUISmartChargeClient` in the private PowerUI framework wh
 
 Native mode delegates charging decisions to macOS. Charging can resume after the battery falls more than 5% below the limit, and macOS occasionally charges to 100% for state-of-charge calibration. A paused or charging status reflects battery telemetry, rather than assuming the requested limit has stopped the battery. The setting persists through sleep and app exit. Choose 100% to permit a full charge; other macOS charging policies can still affect timing.
 
+Temporary full-charge overrides, including those started outside OpenDente, remain separate from the habitual limit. OpenDente uses the underlying supported limit when available, otherwise preserving its saved habitual value.
+
 Optimized Battery Charging can also be read and changed through macOS when the required methods are available. OpenDente verifies the effective setting after a change and reports errors or unsupported states. The optional monthly full-charge schedule uses macOS's separate temporary full-charge operation; it does not replace the saved limit with a permanent 100% setting.
 
 Sailing mode, heat-protection pause, force discharge, the SMC top-up action, MagSafe LED and sleep-inhibition controls require the SMC backend. They are disabled while native policy is active without changing their saved preferences. OpenDente releases its own SMC charging controls when handing charging over to macOS. Native mode does not offer unsupported limits or an immediate charging-inhibit command. Since PowerUI is private, capability checks may reject future incompatible versions; monitoring remains available if charging control is unavailable.
+
+An SMC inhibition whose reply fails or times out is still treated as potentially active. Native control remains blocked until the app confirms that its previous SMC control has been released.
 
 ## Features
 
@@ -54,6 +58,12 @@ Sailing mode, heat-protection pause, force discharge, the SMC top-up action, Mag
 - SMC MagSafe LED reflects actual charging state
 - Per-event native notifications
 
+Settings use an eight-section sidebar instead of a crowded tab strip. Native charging explanations live beside the charging controls; errors and unapplied-limit warnings remain visible on other pages. General settings separate the helper's connection, registration and official-release status, with version details and check timestamps under **Technical Details**.
+
+The menu bar and its Settings preview show a percentage-based battery on battery power, a battery with a lightning bolt while charging, and a plug while connected without charging. The icon turns orange only when macOS Low Power Mode is enabled; the percentage text keeps its normal color. Power-state notifications update the indicator without waiting for the next poll.
+
+Charging indicators follow measured charging and battery power, not merely a requested charging mode. Measured battery discharge or force discharge keeps the battery icon even while plugged in. Missing power telemetry is described as connected but not charging, rather than claiming the battery is unused. Turning off **Charging Mode Icon** hides the charging/plug symbols but retains the Low Power Mode color.
+
 ## Monthly full charging
 
 Enable the monthly schedule explicitly and choose the next date. When a charge is due, OpenDente waits for external power and compatible native temporary full-charge support. The app must be running to start and observe the cycle. Completion is recorded only when battery telemetry actually reports a full charge.
@@ -63,6 +73,10 @@ Before requesting the temporary override, OpenDente records the previous charge-
 ## Local history and privacy
 
 History records minute-level battery and charging data, plus daily health readings. The default retention is 30 days for minute samples, 90 days for events, and 366 days for health readings. Retention can be configured, and the settings provide local export and deletion controls. Events record charging requests and results, external policy changes, monthly-cycle progress, helper reconnections, and app sessions.
+
+Minute charts use averages; daily capacity and cycle summaries use the last actual reading of each metric and its observation time. Older minute files remain readable, but cannot reconstruct exact last readings from averages. Existing daily summaries are preserved; previously recorded averages are not retroactively corrected.
+
+Charts show the chosen time window and recorded values on hover or drag. Long-range drawing is downsampled while inspection keeps minute resolution; gaps remain empty. Charge uses 0 to 100%, battery power includes zero, and capacity scales permit readings above 100%. Apple and OpenDente capacity have distinct symbols and line styles. Cycle counts use a separate chart with integer ticks.
 
 These records are stored on the Mac. OpenDente sends no telemetry or analytics and does not upload history, event logs, or preferences. Helper version diagnostics query the [official upstream GitHub releases](https://github.com/killerk3emstar/OpenDente/releases) and, when available, the release's `opendente-release.json` metadata. A tag alone does not prove the helper version. Missing metadata or an unavailable release is shown as unverifiable rather than claiming the installed helper is up to date. This lookup does not download or install an app or helper update.
 
@@ -96,6 +110,8 @@ The relevant SMC keys differ between Apple Silicon generations:
 - Newer chips (≈2023+, macOS Sequoia and Tahoe): `CHTE`, `CHIE`
 
 OpenDente probes the SMC keys and the native charge-limit backend at startup. A compatible native policy takes priority even when an SMC key set responds. Battery monitoring stays available when neither backend can control charging. The helper panel reports registration and connection separately and checks the version returned by the running helper against the app's required version.
+
+Automatic helper reconnection uses five bounded retries. After exhaustion, waking the Mac or choosing **Check Connection** starts a fresh bounded recovery attempt without replacing a healthy connection. A recovered handshake resynchronizes charging controls and refreshes the diagnostics.
 
 In SMC mode, OpenDente actively flips the charge gate as the battery crosses the threshold. In native mode, macOS maintains the charge limit itself.
 

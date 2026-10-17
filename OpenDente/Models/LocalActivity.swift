@@ -60,12 +60,33 @@ struct BatteryHistoryMinute: Codable, Identifiable, Equatable, Sendable {
     let readingCount: Int
     let validChargeReadingCount: Int
     let averages: [String: Double]
+    let latestValues: [String: Double]?
     let valueCounts: [String: Int]
     let metricLastObservedAt: [String: Date]
     let sources: [String: [String]]
     let healthQualities: [String]
     var id: String { "\(sessionID.uuidString)-\(firstObservedAt.timeIntervalSince1970)-\(lastObservedAt.timeIntervalSince1970)" }
     func value(_ metric: HistoryMetric) -> Double? { averages[metric.rawValue] }
+    func lastObservedValue(_ metric: HistoryMetric) -> Double? { latestValues?[metric.rawValue] }
+
+    init(schemaVersion: Int, sessionID: UUID, timestamp: Date, firstObservedAt: Date,
+         lastObservedAt: Date, readingCount: Int, validChargeReadingCount: Int,
+         averages: [String: Double], valueCounts: [String: Int], metricLastObservedAt: [String: Date],
+         sources: [String: [String]], healthQualities: [String], latestValues: [String: Double]? = nil) {
+        self.schemaVersion = schemaVersion
+        self.sessionID = sessionID
+        self.timestamp = timestamp
+        self.firstObservedAt = firstObservedAt
+        self.lastObservedAt = lastObservedAt
+        self.readingCount = readingCount
+        self.validChargeReadingCount = validChargeReadingCount
+        self.averages = averages
+        self.latestValues = latestValues
+        self.valueCounts = valueCounts
+        self.metricLastObservedAt = metricLastObservedAt
+        self.sources = sources
+        self.healthQualities = healthQualities
+    }
 }
 
 /// One minute is written once. A long pause creates a new minute, never synthetic samples.
@@ -85,12 +106,14 @@ struct MinuteHistoryAccumulator {
         guard let first = current.first, let last = current.last else { return nil }
         var sums: [String: Double] = [:]
         var counts: [String: Int] = [:]
+        var latestValues: [String: Double] = [:]
         var sources: [String: Set<String>] = [:]
         var metricTimes: [String: Date] = [:]
         for reading in current {
             for (metric, value) in reading.values {
                 sums[metric.rawValue, default: 0] += value
                 counts[metric.rawValue, default: 0] += 1
+                latestValues[metric.rawValue] = value
                 metricTimes[metric.rawValue] = reading.timestamp
                 if let source = reading.sources[metric.rawValue] { sources[metric.rawValue, default: []].insert(source) }
             }
@@ -102,7 +125,7 @@ struct MinuteHistoryAccumulator {
             averages: sums.mapValues { $0 }.reduce(into: [:]) { result, entry in
                 result[entry.key] = entry.value / Double(counts[entry.key, default: 1])
             }, valueCounts: counts, metricLastObservedAt: metricTimes, sources: sources.mapValues { $0.sorted() },
-            healthQualities: Array(Set(current.map(\.healthQuality))).sorted())
+            healthQualities: Array(Set(current.map(\.healthQuality))).sorted(), latestValues: latestValues)
         current.removeAll(keepingCapacity: true)
         return result
     }
@@ -137,25 +160,33 @@ enum HistoryPlot {
     /// Missing metric values, separate sessions and pauses split the series.
     static func points(_ rows: [BatteryHistoryMinute], metric: HistoryMetric,
                        maximumPoints: Int = 1_500) -> [HistoryPlotPoint] {
-        var segments: [[HistoryPlotPoint]] = []
+        var points: [HistoryPlotPoint] = []
+        points.reserveCapacity(rows.count)
+        var segment = -1
         var previous: BatteryHistoryMinute?
         var broken = true
         for row in rows.sorted(by: { $0.firstObservedAt < $1.firstObservedAt }) {
             guard let value = row.value(metric), value.isFinite else { broken = true; continue }
             let gap = previous.map { row.firstObservedAt.timeIntervalSince($0.lastObservedAt) > 15
                 || row.firstObservedAt < $0.lastObservedAt || row.sessionID != $0.sessionID } ?? true
-            if broken || gap { segments.append([]) }
-            let segment = segments.count - 1
-            segments[segment].append(.init(timestamp: row.timestamp, value: value, segment: segment))
+            if broken || gap { segment += 1 }
+            points.append(.init(timestamp: row.timestamp, value: value, segment: segment))
             previous = row
             broken = false
         }
-        let total = segments.reduce(0) { $0 + $1.count }
-        let step = max(1, Int(ceil(Double(total) / Double(max(1, maximumPoints)))))
-        return segments.flatMap { segment in
-            segment.enumerated().compactMap { index, point in
-                index == 0 || index == segment.count - 1 || index.isMultiple(of: step) ? point : nil
-            }
+        return downsample(points, maximumPoints: maximumPoints)
+    }
+
+    static func downsample(_ points: [HistoryPlotPoint], maximumPoints: Int = 1_500) -> [HistoryPlotPoint] {
+        let step = max(1, Int(ceil(Double(points.count) / Double(max(1, maximumPoints)))))
+        guard step > 1 else { return points }
+        var indexInSegment = 0
+        return points.enumerated().compactMap { index, point in
+            let first = index == 0 || points[index - 1].segment != point.segment
+            let last = index == points.count - 1 || points[index + 1].segment != point.segment
+            if first { indexInSegment = 0 }
+            defer { indexInSegment += 1 }
+            return first || last || indexInSegment.isMultiple(of: step) ? point : nil
         }
     }
 

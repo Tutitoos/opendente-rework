@@ -63,7 +63,6 @@
 "Capacity (Estimated)" = "Capacidad (estimada)";
 "Capacity / Design" = "Capacidad / diseño";
 "Capacity Source" = "Fuente de la capacidad";
-"Capacity and Cycles · Daily Summary" = "Capacidad y ciclos · Resumen diario";
 "Capacity data is unavailable." = "Los datos de capacidad no están disponibles.";
 "Capacity sensors unavailable" = "Sensores de capacidad no disponibles";
 "Category" = "Categoría";
@@ -224,7 +223,6 @@
 "Newer than Latest Release · %@" = "Más reciente que la última publicación · %@";
 "Next Full Charge" = "Próxima carga completa";
 "No" = "No";
-"No Daily Capacity Readings Yet" = "Todavía no hay lecturas diarias de capacidad";
 "No Events Recorded" = "No hay eventos registrados";
 "No Matching Events" = "No hay eventos que coincidan";
 "No Official Release Published" = "No hay ninguna versión oficial publicada";
@@ -428,3 +426,13 @@
 "optimized charging retention is not a Boolean" = "el estado de retención de la carga optimizada no es un valor booleano";
 "optimized charging override permission is not a Boolean" = "el permiso de excepción de la carga optimizada no es un valor booleano";
 "macOS did not return optimized charging retention." = "macOS no ha devuelto el estado de retención de la carga optimizada.";
+"Low Power Mode" = "Modo de bajo consumo";
+"External Power" = "Alimentación externa";
+"Plugged In, Not Charging" = "Conectado, sin cargar";
+"Daily Readings" = "Lecturas diarias";
+"One-minute Averages" = "Promedios de un minuto";
+"Latest Reading" = "Última lectura";
+"Selected Reading" = "Lectura seleccionada";
+"No Reading Here" = "Sin lectura en este punto";
+"No Daily Readings Yet" = "Todavía no hay lecturas diarias";
+"Move the pointer over the chart to inspect a reading." = "Pasa el puntero por la gráfica para consultar una lectura.";

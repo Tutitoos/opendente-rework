@@ -514,10 +514,17 @@ final class ChargingManager: ObservableObject {
             if settings.legacySMCChargeLimit == nil {
                 settings.legacySMCChargeLimit = settings.chargeLimit
             }
-            let habitualLimit = snapshot.isTemporaryOverride
-                ? settings.monthlyFullChargeCycle?.previousPolicy.chargeLimit.effectiveLimit
-                    ?? (settings.monthlyChargeRecoveryUnknown ? settings.chargeLimit : snapshot.effectiveLimit)
-                : snapshot.effectiveLimit
+            let habitualLimit: Int
+            if !snapshot.isTemporaryOverride {
+                habitualLimit = snapshot.effectiveLimit
+            } else if let cycle = settings.monthlyFullChargeCycle {
+                habitualLimit = cycle.previousPolicy.chargeLimit.effectiveLimit
+            } else if !settings.monthlyChargeRecoveryUnknown,
+                      snapshot.limit < 100, limits.contains(snapshot.limit) {
+                habitualLimit = snapshot.limit
+            } else {
+                habitualLimit = settings.chargeLimit
+            }
             lastObservedSettingsLimit = habitualLimit
             if settings.chargeLimit != habitualLimit {
                 settings.chargeLimit = habitualLimit
@@ -1380,6 +1387,10 @@ final class ChargingManager: ObservableObject {
         guard let command = activeControlOperation, command.id == id else { return }
         controlTimeout.cancel()
         activeControlOperation = nil
+        // A failed or missing reply cannot prove our dispatched inhibition was rolled back.
+        if !success && (command.operation == .inhibitCharging || command.operation == .forceDischarge(true)) {
+            ownsSMCChargingGate = true
+        }
 
         if success {
             switch command.operation {
@@ -1393,11 +1404,6 @@ final class ChargingManager: ObservableObject {
         if isReleasingSMCForNative {
             if success { continueNativeSMCRelease() }
             else {
-                // A reply failure cannot prove the previously dispatched own
-                // inhibition was rolled back. Retain it for targeted recovery.
-                if command.operation == .inhibitCharging || command.operation == .forceDischarge(true) {
-                    ownsSMCChargingGate = true
-                }
                 failNativeSMCRelease(detail: error)
             }
             return

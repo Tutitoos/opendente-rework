@@ -3,57 +3,127 @@ import ServiceManagement
 import UserNotifications
 import os.log
 
-/// Settings window with tabbed interface
+enum SettingsPage: String, CaseIterable, Identifiable {
+    case general = "General"
+    case charge = "Charge"
+    case notifications = "Notifications"
+    case statusBar = "Status Bar"
+    case popover = "Popover"
+    case battery = "Battery"
+    case history = "History"
+    case events = "Event Log"
+
+    var id: Self { self }
+    var symbolName: String {
+        switch self {
+        case .general: "gearshape"
+        case .charge: "bolt.fill"
+        case .notifications: "bell"
+        case .statusBar: "menubar.rectangle"
+        case .popover: "list.bullet"
+        case .battery: "battery.100percent"
+        case .history: "chart.xyaxis.line"
+        case .events: "list.bullet.rectangle"
+        }
+    }
+}
+
+/// A stable sidebar leaves room for localized labels and the selected page.
 struct SettingsView: View {
     @ObservedObject private var language = LanguageManager.shared
     @ObservedObject var charging = ChargingManager.shared
+    @ObservedObject var settings = AppSettings.shared
+    var helperMonitor = HelperStatusMonitor.shared
+    @State var selection: SettingsPage? = .general
+
+    private var page: SettingsPage { selection ?? .general }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if charging.isUsingNativeChargeLimit {
-                NativeChargeLimitNotice(presentation: NativeChargeLimitPresentation(
-                    requestedLimit: AppSettings.shared.chargeLimit,
-                    effectiveLimit: charging.effectiveNativeChargeLimit,
-                    availableLimits: charging.availableNativeChargeLimits,
-                    error: charging.localizedNativeChargeLimitError,
-                    isTemporaryOverride: charging.isNativeChargeLimitTemporarilyOverridden
-                ))
-                    .padding(12)
-                Divider()
-            } else if !charging.canControlChargeLimit {
-                ChargingControlNotice(isHelperInstalled: charging.isHelperInstalled)
-                    .padding(12)
-                Divider()
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                Label {
+                    Text("OpenDente").font(.headline)
+                } icon: {
+                    Image(systemName: "battery.100percent")
+                        .foregroundStyle(.green)
+                        .padding(7)
+                        .background(.green.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 20)
+
+                List(SettingsPage.allCases, selection: $selection) { destination in
+                    Label(L10n.tr(destination.rawValue), systemImage: destination.symbolName)
+                        .padding(.vertical, 5)
+                        .tag(destination)
+                }
+                .listStyle(.sidebar)
+                .accessibilityLabel(L10n.tr("OpenDente Settings"))
             }
+            .frame(width: 184)
+            .background(.bar)
 
-            TabView {
-                GeneralTab()
-                    .tabItem { Label(L10n.tr("General"), systemImage: "gear") }
+            Divider()
 
-                ChargingTab()
-                    .tabItem { Label(L10n.tr("Charge"), systemImage: "bolt.fill") }
+            VStack(spacing: 0) {
+                HStack {
+                    Text(L10n.tr(page.rawValue)).font(.title2.weight(.semibold))
+                    Spacer()
+                    if charging.isUsingNativeChargeLimit {
+                        Label("macOS", systemImage: "apple.logo")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(.quaternary, in: Capsule())
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 18)
+                Divider()
 
-                NotificationsTab()
-                    .tabItem { Label(L10n.tr("Notifications"), systemImage: "bell") }
+                if page != .charge {
+                    if charging.isUsingNativeChargeLimit {
+                        let presentation = NativeChargeLimitPresentation(
+                            requestedLimit: settings.chargeLimit,
+                            effectiveLimit: charging.effectiveNativeChargeLimit,
+                            availableLimits: charging.availableNativeChargeLimits,
+                            error: charging.localizedNativeChargeLimitError,
+                            isTemporaryOverride: charging.isNativeChargeLimitTemporarilyOverridden
+                        )
+                        if presentation.hasWarning {
+                            NativeChargeLimitNotice(presentation: presentation, compact: true)
+                                .padding(16)
+                                .background(.orange.opacity(0.06))
+                        }
+                    } else if !charging.canControlChargeLimit {
+                        ChargingControlNotice(isHelperInstalled: charging.isHelperInstalled)
+                            .padding(16)
+                            .background(.orange.opacity(0.06))
+                    }
+                }
 
-                StatusBarTab()
-                    .tabItem { Label(L10n.tr("Status Bar"), systemImage: "menubar.rectangle") }
-
-                PopoverItemsTab()
-                    .tabItem { Label(L10n.tr("Popover"), systemImage: "list.bullet") }
-
-                BatteryInfoTab()
-                    .tabItem { Label(L10n.tr("Battery"), systemImage: "battery.100percent") }
-
-                HistoryTab()
-                    .tabItem { Label(L10n.tr("History"), systemImage: "chart.xyaxis.line") }
-
-                EventLogTab()
-                    .tabItem { Label(L10n.tr("Event Log"), systemImage: "list.bullet.rectangle") }
+                pageContent
+                    .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
             }
+            .background(Color(nsColor: .windowBackgroundColor))
         }
         .environment(\.locale, language.locale)
-        .frame(minWidth: 640, idealWidth: 680)
+        .frame(minWidth: 760, idealWidth: 840, minHeight: 520, idealHeight: 640)
+    }
+
+    @ViewBuilder
+    private var pageContent: some View {
+        switch page {
+        case .general: GeneralTab(settings: settings, charging: charging, helperMonitor: helperMonitor)
+        case .charge: ChargingTab(settings: settings, charging: charging)
+        case .notifications: NotificationsTab(settings: settings, charging: charging)
+        case .statusBar: StatusBarTab(settings: settings, charging: charging)
+        case .popover: PopoverItemsTab(settings: settings)
+        case .battery: BatteryInfoTab(charging: charging, settings: settings)
+        case .history: HistoryTab()
+        case .events: EventLogTab()
+        }
     }
 }
 
@@ -170,7 +240,7 @@ struct NativeChargeLimitNotice: View {
                  : "macOS applies the charge limit. It may resume after the battery drops more than 5% and occasionally charge to 100% for calibration. The limit persists during sleep and after quitting OpenDente."))
                 .foregroundStyle(.secondary)
         }
-        .font(.caption)
+        .font(compact ? .caption : .callout)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
@@ -183,21 +253,17 @@ struct GeneralTab: View {
     @ObservedObject private var language = LanguageManager.shared
     @ObservedObject var settings = AppSettings.shared
     @ObservedObject var charging = ChargingManager.shared
+    var helperMonitor = HelperStatusMonitor.shared
     @StateObject private var loginItem = LoginItemController(settings: AppSettings.shared)
 
     var body: some View {
         Form {
-            Section(L10n.tr("Language")) {
+            Section {
                 Picker(L10n.tr("Language"), selection: $language.selection) {
                     ForEach(LanguageSelection.allCases) { selection in
                         Text(selection == .system ? L10n.tr("System") : selection.displayName).tag(selection)
                     }
                 }
-                Text(L10n.tr("Changes apply immediately. System uses the language selected in macOS."))
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section {
                 Toggle(L10n.tr("Launch at Login"), isOn: Binding(
                     get: { loginItem.isEnabled }, set: { loginItem.setEnabled($0) }
                 ))
@@ -206,6 +272,18 @@ struct GeneralTab: View {
                 }
                 if loginItem.requiresApproval {
                     Button(L10n.tr("Open Login Items Settings")) { SMAppService.openSystemSettingsLoginItems() }
+                }
+            } footer: {
+                Text(L10n.tr("Changes apply immediately. System uses the language selected in macOS."))
+            }
+
+            Section(L10n.tr("Privileged Helper")) {
+                HelperStatusPanel(monitor: helperMonitor)
+                if !charging.isHelperInstalled {
+                    helperActions
+                    Text(L10n.tr("The helper daemon is required for SMC charging controls. The native macOS charge limit works without it."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -216,18 +294,6 @@ struct GeneralTab: View {
                     Text("\(version) (\(build))")
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
-                }
-            }
-
-            Section {
-                HelperStatusPanel()
-
-                if !charging.isHelperInstalled {
-                    helperActions
-
-                    Text(L10n.tr("The helper daemon is required for SMC charging controls. The native macOS charge limit works without it."))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -336,6 +402,15 @@ struct ChargingTab: View {
 
     var body: some View {
         Form {
+            if charging.isUsingNativeChargeLimit {
+                Section {
+                    NativeChargeLimitNotice(presentation: nativeLimitPresentation)
+                }
+            } else if !canControlCharging {
+                Section {
+                    ChargingControlNotice(isHelperInstalled: charging.isHelperInstalled)
+                }
+            }
             Section(L10n.tr("Charge Limit")) {
                 if charging.isUsingNativeChargeLimit {
                     Picker(L10n.tr(nativeLimitPresentation.hasConfirmedTemporaryFullCharge ? "Usual Limit" : "Native Limit"), selection: Binding(
@@ -573,8 +648,13 @@ struct StatusBarTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 6) {
-                    Image(systemName: statusBarIcon)
-                        .font(.system(size: 15))
+                    let icon = statusBarPresentation
+                    if let image = icon.makeImage() {
+                        Image(nsImage: image)
+                            .renderingMode(icon.usesLowPowerColor ? .original : .template)
+                            .foregroundStyle(.primary)
+                            .accessibilityLabel(icon.accessibilityLabel)
+                    }
                     if !statusBarPreview.isEmpty {
                         Text(statusBarPreview)
                             .font(.system(size: 13, design: .monospaced))
@@ -590,13 +670,13 @@ struct StatusBarTab: View {
         .formStyle(.grouped)
     }
 
-    private var statusBarIcon: String {
-        let state = battery.batteryState
-        let pct = state.effectivePercentage(useHardware: settings.useHardwareBatteryPercentage)
-        let mode: ChargingMode = charging.canControlChargeLimit ? charging.mode : .idle
-        return settings.statusBarShowMode
-            ? mode.batteryIconName(percentage: pct, isCharging: state.isCharging)
-            : ChargingMode.idle.batteryIconName(percentage: pct, isCharging: false)
+    private var statusBarPresentation: StatusBarBatteryPresentation {
+        StatusBarBatteryPresentation(
+            state: battery.batteryState,
+            mode: charging.canControlChargeLimit ? charging.mode : .idle,
+            useHardwarePercentage: settings.useHardwareBatteryPercentage,
+            showMode: settings.statusBarShowMode
+        )
     }
 
     private var statusBarPreview: String {
