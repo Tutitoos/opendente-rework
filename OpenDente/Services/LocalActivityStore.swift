@@ -300,13 +300,13 @@ actor LocalActivityStore {
         try Task.checkCancellation()
         for url in try partitions("minutes", since: earliest, until: now) {
             try Task.checkCancellation()
-            try autoreleasepool {
-                let (rows, skipped): ([BatteryHistoryMinute], Int) = try readPartition(url)
-                damaged += skipped
-                let ordered = rows.filter { $0.timestamp >= earliest && $0.timestamp <= now }
-                    .sorted { $0.firstObservedAt < $1.firstObservedAt }
-                try visit(ordered)
+            let (rows, skipped): ([BatteryHistoryMinute], Int) = try autoreleasepool {
+                try readPartition(url)
             }
+            damaged += skipped
+            let ordered = rows.filter { $0.timestamp >= earliest && $0.timestamp <= now }
+                .sorted { $0.firstObservedAt < $1.firstObservedAt }
+            try visit(ordered)
         }
         return damaged
     }
