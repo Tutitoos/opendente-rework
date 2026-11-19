@@ -160,9 +160,10 @@ enum L10n {
             .precision(.fractionLength(fractionDigits)))
     }
 
-    static func date(_ date: Date, includeTime: Bool = false) -> String {
+    static func date(_ date: Date, includeTime: Bool = false, timeZone: TimeZone = .current) -> String {
         let formatter = DateFormatter()
         formatter.locale = locale
+        formatter.timeZone = timeZone
         formatter.dateStyle = .medium
         formatter.timeStyle = includeTime ? .short : .none
         return formatter.string(from: date)

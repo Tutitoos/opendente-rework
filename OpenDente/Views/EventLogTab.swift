@@ -41,6 +41,8 @@ extension LocalActivityEvent {
         case "application.stopped": return tr("OpenDente Stopped")
         case "application.sleep": return tr("Mac Entered Sleep")
         case "application.wake": return tr("Mac Woke from Sleep")
+        case "charging.sourceChanged": return tr(values["ac"] == "true" ? "Switched to AC power" : "Switched to battery power")
+        case "charging.targetChanged": return format("Configured charge limit · %@%%", limit)
         case "native.limitRequested": return format("Charge limit requested: %@%%", limit)
         case "native.limitConfirmed": return values["external"] == "true"
             ? format("External charge limit observed: %@%%", limit)
@@ -166,6 +168,10 @@ struct EventLogTab: View {
                     ForEach(ActivitySeverity.allCases, id: \.self) { Text($0.title).tag(Optional($0)) }
                 }.labelsHidden()
             }
+            if events.count == LocalActivityStore.eventDisplayLimit {
+                Text(L10n.format("Searching the latest %@ events", events.count.formatted(.number.locale(language.locale))))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if loading { ProgressView().controlSize(.small) }
             if filtered.isEmpty && !loading {
                 VStack(spacing: 8) {
@@ -209,8 +215,8 @@ struct EventLogTab: View {
             }
             if damaged > 0 {
                 Text(L10n.format(damaged == 1
-                                ? "%d damaged record was skipped. Valid records remain available."
-                                : "%d damaged records were skipped. Valid records remain available.", damaged))
+                                ? "%d damaged record in the scanned days was skipped."
+                                : "%d damaged records in the scanned days were skipped.", damaged))
                     .font(.caption).foregroundStyle(.orange)
             }
             if let error = error ?? recorder.storageError { Text(L10n.tr(error)).font(.caption).foregroundStyle(.red) }
@@ -219,8 +225,10 @@ struct EventLogTab: View {
                     ForEach([30, 90, 365], id: \.self) { Text(L10n.format("%d days", $0)).tag($0) }
                 }.frame(maxWidth: 185)
                 Spacer()
-                Text(L10n.format(events.count == 1 ? "Showing the latest %d event" : "Showing the latest %d events", events.count))
-                    .font(.caption).foregroundStyle(.secondary)
+                if events.count < LocalActivityStore.eventDisplayLimit {
+                    Text(L10n.format(events.count == 1 ? "Showing the latest %d event" : "Showing the latest %d events", events.count))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             HStack {
                 Button(L10n.tr("Refresh")) { Task { await reload() } }
@@ -230,7 +238,7 @@ struct EventLogTab: View {
             }.font(.caption)
         }.padding(20)
         .task { await reload() }
-        .onChange(of: recorder.revision) { _, _ in Task { await reload() } }
+        .onChange(of: recorder.eventRevision) { _, _ in Task { await reload() } }
         .confirmationDialog(L10n.tr("Clear all local events?"), isPresented: $showClearConfirmation) {
             Button(L10n.tr("Clear Events"), role: .destructive) {
                 Task {

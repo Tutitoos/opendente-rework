@@ -47,6 +47,14 @@ struct PopoverView: View {
         isPluggedIn || mode == .discharging
     }
 
+    static func topUpHelpKey(native: Bool, thermalHold: Bool, temperature: Double?) -> String {
+        if native { return "Choose 100% below to change the native limit" }
+        if thermalHold {
+            return temperature == nil ? "Waiting for a temperature reading" : "Waiting for the battery to cool down"
+        }
+        return "Top Up to 100%"
+    }
+
     private var canDischarge: Bool {
         charging.supportsSMCControls && battery.batteryState.hasValidBatteryReading && Self.canDischarge(
             isPluggedIn: battery.batteryState.isPluggedIn,
@@ -177,8 +185,11 @@ struct PopoverView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(!battery.batteryState.hasValidBatteryReading || !battery.batteryState.isPluggedIn || !charging.supportsSMCControls)
-                .help(L10n.tr(charging.isUsingNativeChargeLimit ? "Choose 100% below to change the native limit" : "Top Up to 100%"))
+                .disabled(charging.isThermalHoldActive || !battery.batteryState.hasValidBatteryReading || !battery.batteryState.isPluggedIn || !charging.supportsSMCControls)
+                .accessibilityLabel(L10n.tr("Top Up to 100%"))
+                .help(L10n.tr(Self.topUpHelpKey(native: charging.isUsingNativeChargeLimit,
+                                               thermalHold: charging.isThermalHoldActive,
+                                               temperature: battery.batteryState.temperature)))
 
                 Button(action: { charging.startDischarge() }) {
                     Image(systemName: "arrow.down.circle")
@@ -186,7 +197,7 @@ struct PopoverView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(!canDischarge)
+                .disabled(charging.isThermalHoldActive || !canDischarge)
                 .help(L10n.tr(charging.isUsingNativeChargeLimit ? "Force discharge requires SMC charging control" : "Discharge to Limit"))
             }
 

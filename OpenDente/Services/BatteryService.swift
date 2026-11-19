@@ -33,6 +33,17 @@ struct BatteryCapacitySnapshot: Equatable {
 
 /// Pure parsers used by the polling path and regression fixtures alike.
 enum BatteryReadingParser {
+    static func batteryTemperature(_ value: SMCValue?) -> Double? {
+        guard let value else { return nil }
+        let temperature: Double? = switch (value.trimmedDataType, value.dataSize) {
+        case ("flt", 4): value.floatValue.map(Double.init)
+        case ("sp78", 2): value.sp78Value
+        default: nil
+        }
+        guard let temperature, temperature.isFinite, temperature >= -20 else { return nil }
+        return temperature
+    }
+
     static func unsigned16(_ value: SMCValue?) -> Int? {
         guard let value, value.trimmedDataType == "ui16", value.dataSize == 2,
               value.bytes.count == 2, let raw = value.uint16Value else { return nil }
@@ -558,15 +569,7 @@ final class BatteryService: ObservableObject {
     private func readSMCData() -> SMCData {
         var data = SMCData()
 
-        // Temperature: prefer TB0T/TB1T (flt on Apple Silicon) over B0AT (ui16 deci-Kelvin)
-        if let val = smc.readKeyOptional("TB0T") {
-            if val.dataType.hasPrefix("flt"), let f = val.floatValue {
-                data.temperature = Double(f)
-            } else if let sp = val.sp78Value {
-                data.temperature = sp
-            }
-        }
-        // Fallback to B0AT if TB0T didn't work
+        data.temperature = BatteryReadingParser.batteryTemperature(smc.readKeyOptional("TB0T"))
         if data.temperature == nil, let val = smc.readKeyOptional("B0AT") {
             if val.dataType == "ui16", let raw = val.uint16Value {
                 let celsius = (Double(raw) - 2732.0) / 10.0

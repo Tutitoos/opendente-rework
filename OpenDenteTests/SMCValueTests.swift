@@ -66,6 +66,14 @@ final class SMCValueTests: XCTestCase {
     // MARK: - Float (32-bit IEEE 754, little-endian on ARM)
     // Used for: temperatures (TB0T on Apple Silicon)
 
+    func testBatteryTemperatureRequiresARecognizedCompleteSensorReading() {
+        XCTAssertEqual(BatteryReadingParser.batteryTemperature(makeValue(dataType: "sp78", bytes: [0x80, 0x19])), 25.5)
+        XCTAssertEqual(BatteryReadingParser.batteryTemperature(makeValue(dataType: "flt ", bytes: bitsToLE(Float(35).bitPattern))), 35)
+        XCTAssertNil(BatteryReadingParser.batteryTemperature(makeValue(dataType: "ui16", bytes: [0x80, 0x19])))
+        XCTAssertNil(BatteryReadingParser.batteryTemperature(makeValue(dataType: "flt ", bytes: [0x80, 0x19])))
+        XCTAssertNil(BatteryReadingParser.batteryTemperature(makeValue(dataType: "flt ", bytes: bitsToLE(Float.nan.bitPattern))))
+    }
+
     func testFloat_roomTemperature() {
         let expected: Float = 35.0
         let bits = expected.bitPattern

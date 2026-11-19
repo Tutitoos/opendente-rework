@@ -13,7 +13,12 @@ struct BatteryHistoryReading: Sendable {
     let chargeValid: Bool
     let healthQuality: String
 
-    init(state: BatteryState, at timestamp: Date) {
+    var onAC: Bool?
+    var limit: Int?
+
+    init(state: BatteryState, at timestamp: Date, limit: Int? = nil) {
+        self.limit = limit
+        onAC = state.hasValidBatteryReading ? state.isPluggedIn : nil
         self.timestamp = timestamp
         var values: [HistoryMetric: Double] = [:]
         let validCharge = state.hasValidBatteryReading && (0...100).contains(state.percentage)
@@ -51,7 +56,47 @@ struct BatteryHistoryReading: Sendable {
     }
 }
 
+struct BatteryUsage: Codable, Equatable, Sendable {
+    var acSeconds = 0.0, batterySeconds = 0.0, energySeconds = 0.0
+    var chargedWh = 0.0, dischargedWh = 0.0
+
+    mutating func add(_ other: Self) {
+        acSeconds += other.acSeconds
+        batterySeconds += other.batterySeconds
+        energySeconds += other.energySeconds
+        chargedWh += other.chargedWh
+        dischargedWh += other.dischargedWh
+    }
+
+    mutating func integrate(_ a: BatteryHistoryReading, _ b: BatteryHistoryReading, from: Date, to: Date) {
+        let span = b.timestamp.timeIntervalSince(a.timestamp), seconds = to.timeIntervalSince(from)
+        guard span > 0, span <= 15, seconds > 0, a.chargeValid, b.chargeValid else { return }
+        if let ac = a.onAC, ac == b.onAC {
+            if ac { acSeconds += seconds } else { batterySeconds += seconds }
+        }
+        guard let start = a.values[.batteryPower], let end = b.values[.batteryPower] else { return }
+        let slope = (end - start) / span
+        let x = start + slope * from.timeIntervalSince(a.timestamp)
+        let y = start + slope * to.timeIntervalSince(a.timestamp)
+        energySeconds += seconds
+        let hours = seconds / 3600
+        if x * y < 0 {
+            let peak = max(x, y), trough = -min(x, y)
+            chargedWh += hours * peak * peak / (2 * (peak + trough))
+            dischargedWh += hours * trough * trough / (2 * (peak + trough))
+        } else {
+            let wh = hours * (x + y) / 2
+            chargedWh += max(0, wh)
+            dischargedWh += max(0, -wh)
+        }
+    }
+}
+
 struct BatteryHistoryMinute: Codable, Identifiable, Equatable, Sendable {
+    var usage: BatteryUsage?
+    var onAC: Bool?
+    var limit: Int?
+    var initialCharge: Double?
     let schemaVersion: Int
     let sessionID: UUID
     let timestamp: Date
@@ -91,42 +136,64 @@ struct BatteryHistoryMinute: Codable, Identifiable, Equatable, Sendable {
 
 /// One minute is written once. A long pause creates a new minute, never synthetic samples.
 struct MinuteHistoryAccumulator {
-    private var current: [BatteryHistoryReading] = []
+    private var firstObservedAt: Date?
+    private var initialCharge: Double?
+    private var last: BatteryHistoryReading?
+    private var readingCount = 0
+    private var validChargeCount = 0
+    private var sums: [String: Double] = [:]
+    private var counts: [String: Int] = [:]
+    private var latestValues: [String: Double] = [:]
+    private var sources: [String: Set<String>] = [:]
+    private var metricTimes: [String: Date] = [:]
+    private var qualities: Set<String> = []
+    private var usage = BatteryUsage()
     private let sessionID: UUID
     init(sessionID: UUID = UUID()) { self.sessionID = sessionID }
 
     mutating func add(_ reading: BatteryHistoryReading) -> BatteryHistoryMinute? {
-        let previous = current.first.map { Self.minute($0.timestamp) }
-        let flushed = previous != nil && previous != Self.minute(reading.timestamp) ? flush() : nil
-        current.append(reading)
+        let bucket = Self.minute(reading.timestamp)
+        let previous = last
+        let changed = previous.map { Self.minute($0.timestamp) != bucket } ?? false
+        if let previous {
+            usage.integrate(previous, reading, from: previous.timestamp, to: changed ? bucket : reading.timestamp)
+        }
+        let flushed = changed ? flush() : nil
+        if changed, let previous {
+            usage.integrate(previous, reading, from: bucket, to: reading.timestamp)
+        }
+        if firstObservedAt == nil { firstObservedAt = reading.timestamp }
+        if initialCharge == nil { initialCharge = reading.values[.charge] }
+        last = reading
+        readingCount += 1
+        if reading.chargeValid { validChargeCount += 1 }
+        qualities.insert(reading.healthQuality)
+        for (metric, value) in reading.values {
+            let key = metric.rawValue
+            sums[key, default: 0] += value
+            counts[key, default: 0] += 1
+            latestValues[key] = value
+            metricTimes[key] = reading.timestamp
+            if let source = reading.sources[key] { sources[key, default: []].insert(source) }
+        }
         return flushed
     }
 
     mutating func flush() -> BatteryHistoryMinute? {
-        guard let first = current.first, let last = current.last else { return nil }
-        var sums: [String: Double] = [:]
-        var counts: [String: Int] = [:]
-        var latestValues: [String: Double] = [:]
-        var sources: [String: Set<String>] = [:]
-        var metricTimes: [String: Date] = [:]
-        for reading in current {
-            for (metric, value) in reading.values {
-                sums[metric.rawValue, default: 0] += value
-                counts[metric.rawValue, default: 0] += 1
-                latestValues[metric.rawValue] = value
-                metricTimes[metric.rawValue] = reading.timestamp
-                if let source = reading.sources[metric.rawValue] { sources[metric.rawValue, default: []].insert(source) }
-            }
-        }
-        let result = BatteryHistoryMinute(schemaVersion: 1, sessionID: sessionID,
-            timestamp: Self.minute(first.timestamp), firstObservedAt: first.timestamp,
-            lastObservedAt: last.timestamp, readingCount: current.count,
-            validChargeReadingCount: current.filter(\.chargeValid).count,
-            averages: sums.mapValues { $0 }.reduce(into: [:]) { result, entry in
+        guard let firstObservedAt, let last else { return nil }
+        var result = BatteryHistoryMinute(schemaVersion: 1, sessionID: sessionID,
+            timestamp: Self.minute(firstObservedAt), firstObservedAt: firstObservedAt,
+            lastObservedAt: last.timestamp, readingCount: readingCount,
+            validChargeReadingCount: validChargeCount,
+            averages: sums.reduce(into: [:]) { result, entry in
                 result[entry.key] = entry.value / Double(counts[entry.key, default: 1])
             }, valueCounts: counts, metricLastObservedAt: metricTimes, sources: sources.mapValues { $0.sorted() },
-            healthQualities: Array(Set(current.map(\.healthQuality))).sorted(), latestValues: latestValues)
-        current.removeAll(keepingCapacity: true)
+            healthQualities: qualities.sorted(), latestValues: latestValues)
+        result.usage = usage
+        result.initialCharge = initialCharge
+        result.onAC = last.onAC
+        result.limit = last.limit
+        self = Self(sessionID: sessionID)
         return result
     }
 
@@ -147,6 +214,27 @@ struct DailyBatteryHealth: Codable, Identifiable, Equatable, Sendable {
     let sources: [String: [String]]
     let quality: [String]
     var id: Date { day }
+
+    static func merging(_ minute: BatteryHistoryMinute, with previous: Self?) -> Self {
+        var sources = previous?.sources ?? [:]
+        func latest(_ metric: HistoryMetric, oldValue: Double?, observedAt: Date?) -> (Double?, Date?) {
+            guard let value = minute.lastObservedValue(metric) else { return (oldValue, observedAt) }
+            let timestamp = minute.metricLastObservedAt[metric.rawValue] ?? minute.lastObservedAt
+            if oldValue != nil, let oldTime = observedAt ?? previous?.lastObservedAt, timestamp < oldTime {
+                return (oldValue, observedAt)
+            }
+            sources[metric.rawValue] = minute.sources[metric.rawValue]
+            return (value, timestamp)
+        }
+        let apple = latest(.appleHealth, oldValue: previous?.applePercentage, observedAt: previous?.appleObservedAt)
+        let capacity = latest(.openDenteHealth, oldValue: previous?.openDentePercentage, observedAt: previous?.openDenteObservedAt)
+        let cycles = latest(.cycles, oldValue: previous?.cycleCount, observedAt: previous?.cyclesObservedAt)
+        return Self(day: LocalActivityStore.day(minute.timestamp),
+                    lastObservedAt: max(previous?.lastObservedAt ?? minute.lastObservedAt, minute.lastObservedAt),
+                    applePercentage: apple.0, openDentePercentage: capacity.0, cycleCount: cycles.0,
+                    appleObservedAt: apple.1, openDenteObservedAt: capacity.1, cyclesObservedAt: cycles.1,
+                    sources: sources, quality: Set((previous?.quality ?? []) + minute.healthQualities).sorted())
+    }
 }
 
 struct HistoryPlotPoint: Identifiable, Sendable {
@@ -160,34 +248,59 @@ enum HistoryPlot {
     /// Missing metric values, separate sessions and pauses split the series.
     static func points(_ rows: [BatteryHistoryMinute], metric: HistoryMetric,
                        maximumPoints: Int = 1_500) -> [HistoryPlotPoint] {
-        var points: [HistoryPlotPoint] = []
-        points.reserveCapacity(rows.count)
-        var segment = -1
-        var previous: BatteryHistoryMinute?
-        var broken = true
-        for row in rows.sorted(by: { $0.firstObservedAt < $1.firstObservedAt }) {
-            guard let value = row.value(metric), value.isFinite else { broken = true; continue }
-            let gap = previous.map { row.firstObservedAt.timeIntervalSince($0.lastObservedAt) > 15
-                || row.firstObservedAt < $0.lastObservedAt || row.sessionID != $0.sessionID } ?? true
-            if broken || gap { segment += 1 }
-            points.append(.init(timestamp: row.timestamp, value: value, segment: segment))
-            previous = row
-            broken = false
+        var series = MinuteSeries()
+        series.append(rows.sorted { $0.firstObservedAt < $1.firstObservedAt }, metric: metric)
+        return downsample(series.points, maximumPoints: maximumPoints)
+    }
+
+    struct MinuteSeries {
+        private(set) var points: [HistoryPlotPoint] = []
+        private var segment = -1
+        private var previous: BatteryHistoryMinute?
+        private var broken = true
+
+        mutating func append(_ orderedRows: [BatteryHistoryMinute], metric: HistoryMetric) {
+            append(orderedRows) { $0.value(metric) }
         }
-        return downsample(points, maximumPoints: maximumPoints)
+
+        mutating func append(_ orderedRows: [BatteryHistoryMinute], valueFor: (BatteryHistoryMinute) -> Double?) {
+            for row in orderedRows {
+                guard let value = valueFor(row), value.isFinite else { broken = true; continue }
+                let gap = previous.map { row.firstObservedAt.timeIntervalSince($0.lastObservedAt) > 15
+                    || row.firstObservedAt < $0.lastObservedAt || row.sessionID != $0.sessionID } ?? true
+                if broken || gap { segment += 1 }
+                points.append(.init(timestamp: row.timestamp, value: value, segment: segment))
+                previous = row
+                broken = false
+            }
+        }
     }
 
     static func downsample(_ points: [HistoryPlotPoint], maximumPoints: Int = 1_500) -> [HistoryPlotPoint] {
-        let step = max(1, Int(ceil(Double(points.count) / Double(max(1, maximumPoints)))))
-        guard step > 1 else { return points }
-        var indexInSegment = 0
-        return points.enumerated().compactMap { index, point in
-            let first = index == 0 || points[index - 1].segment != point.segment
-            let last = index == points.count - 1 || points[index + 1].segment != point.segment
-            if first { indexInSegment = 0 }
-            defer { indexInSegment += 1 }
-            return first || last || indexInSegment.isMultiple(of: step) ? point : nil
+        guard points.count > max(1, maximumPoints) else { return points }
+        let width = Int(ceil(Double(points.count) / Double(max(1, maximumPoints / 2))))
+        var result: [HistoryPlotPoint] = []
+        var start = 0
+        while start < points.count {
+            var end = start + 1
+            var low = start, high = start
+            while end < points.count, end - start < width, points[end].segment == points[start].segment {
+                if points[end].value < points[low].value { low = end }
+                if points[end].value > points[high].value { high = end }
+                end += 1
+            }
+            let first = min(low, high), last = max(low, high)
+            if start == 0 || points[start - 1].segment != points[start].segment, first != start {
+                result.append(points[start])
+            }
+            result.append(points[first])
+            if last != first { result.append(points[last]) }
+            if end == points.count || points[end].segment != points[start].segment, last != end - 1 {
+                result.append(points[end - 1])
+            }
+            start = end
         }
+        return result
     }
 
     static func dailyPoints(_ rows: [DailyBatteryHealth], metric: HistoryMetric) -> [HistoryPlotPoint] {

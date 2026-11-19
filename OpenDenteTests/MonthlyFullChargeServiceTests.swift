@@ -354,6 +354,42 @@ struct MonthlyFullChargeServiceTests {
         #expect(f.control.policy == monthlyPolicy(80))
     }
 
+    @Test func timeoutRestoresWithInvalidTelemetryAndKeepsFailedRestore() {
+        let f = MonthlyFixture()
+        defer { f.cleanUp() }
+        f.begin()
+        f.clock.date = f.clock.date.addingTimeInterval(86400)
+        f.control.restoreFailure = true
+        f.service.evaluate(.unknown)
+        #expect(f.service.status == .failed)
+        #expect(f.settings.monthlyFullChargeCycle?.restorationPending == true)
+        f.control.restoreFailure = false
+        let next = MonthlyFullChargeService(settings: f.settings, battery: f.battery, control: f.control,
+                                          now: { f.clock.date }, calendar: f.calendar, pollingInterval: nil)
+        next.start()
+        defer { next.stop() }
+        #expect(f.settings.monthlyFullChargeCycle == nil)
+        #expect(next.lastFullChargeDate == nil)
+        #expect(f.control.policy == monthlyPolicy(80))
+    }
+
+    @Test func refreshOffersMonthlyScheduleWithoutStartingIt() {
+        let f = MonthlyFixture()
+        defer { f.cleanUp() }
+        f.control.availabilityError = NativeChargeLimitError.unavailable
+        f.service.start()
+        #expect(f.service.availability == .checkFailed && !f.service.canStart)
+        #expect(f.service.errorMessage != nil)
+        f.control.availabilityError = nil
+        f.control.available = false
+        f.service.refreshAvailability()
+        #expect(f.service.availability == .unsupported && f.service.errorMessage == nil)
+        f.control.available = true
+        f.service.refreshAvailability()
+        #expect(f.service.canStart && !f.service.enabled)
+        #expect(f.service.errorMessage == nil && f.control.begins == 0)
+    }
+
     @Test func unsupportedOrUnknownBatteryCannotWrite() {
         let f = MonthlyFixture()
         defer { f.cleanUp() }
@@ -592,6 +628,7 @@ private final class MonthlyFixture {
 @MainActor
 private final class MonthlyNativeMock: MonthlyFullChargeControl {
     var available = true
+    var availabilityError: Error?
     var policy = monthlyPolicy(80)
     var beginFailure = false
     var restoreFailure = false
@@ -602,7 +639,10 @@ private final class MonthlyNativeMock: MonthlyFullChargeControl {
     var continuationError: Error?
     private(set) var begins = 0
     private(set) var restores: [NativeChargingPolicySnapshot] = []
-    func temporaryFullChargeAvailable() throws -> Bool { available }
+    func temporaryFullChargeAvailable() throws -> Bool {
+        if let availabilityError { throw availabilityError }
+        return available
+    }
     func readFullChargePolicy() throws -> NativeChargingPolicySnapshot { policy }
     func canContinueTemporaryFullCharge() throws -> Bool {
         if let continuationError { throw continuationError }

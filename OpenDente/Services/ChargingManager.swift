@@ -136,6 +136,7 @@ final class ChargingManager: ObservableObject {
     private var optimizedRequestError: String?
     private var optimizedRequestErrorSource: Error?
     var heatProtectionTimer: Date?
+    var isThermalHoldActive: Bool { settings.heatProtectionEnabled && heatProtectionTimer != nil }
 
     private enum ControlOperation: Equatable, Sendable {
         case enableCharging
@@ -549,6 +550,9 @@ final class ChargingManager: ObservableObject {
         let unsupported = (error as? NativeChargeLimitError) == .unavailable
         if nativeSupportConfirmed || chargingAPI == .unknown || !unsupported {
             enterNativePolicyIfNeeded()
+        } else if isUsingNativeChargeLimit && !isReleasingSMCForNative {
+            isUsingNativeChargeLimit = false
+            mode = .idle // Reapply SMC policy even if native telemetry showed the same mode.
         }
     }
 
@@ -815,37 +819,26 @@ final class ChargingManager: ObservableObject {
             return
         }
 
-        // Heat protection takes priority
-        if settings.heatProtectionEnabled, mode == .heatProtection, state.temperature == nil {
-            return // Missing sensor data cannot prove the battery has cooled.
-        }
-        if settings.heatProtectionEnabled, let temp = state.temperature {
+        // Keep the thermal hold across unplug/replug. Only a cool, valid reading can end it.
+        if !settings.heatProtectionEnabled {
+            heatProtectionTimer = nil
+        } else if let temp = state.temperature, temp.isFinite, temp >= -20 {
             if temp >= settings.heatProtectionTemp {
-                // Reset hysteresis timer on every spike (including re-spikes during cooldown)
                 heatProtectionTimer = Date()
-                if mode != .heatProtection {
-                    log.warning("Heat protection: \(temp, format: .fixed(precision: 1), privacy: .public)°C ≥ \(self.settings.heatProtectionTemp, format: .fixed(precision: 1), privacy: .public)°C at \(state.percentage, privacy: .public)%")
-                    let wasDischarging = mode == .discharging
-                    mode = .heatProtection
-                    if wasDischarging {
-                        forceDischarge(false)
-                    }
-                    inhibitCharging()
-                }
-                return
-            } else if mode == .heatProtection {
-                if let timer = heatProtectionTimer {
-                    // Hysteresis: wait 5 minutes after temp last exceeded threshold
-                    if Date().timeIntervalSince(timer) >= 300 {
-                        log.info("Heat protection ended: \(temp, format: .fixed(precision: 1), privacy: .public)°C < \(self.settings.heatProtectionTemp, format: .fixed(precision: 1), privacy: .public)°C, cooldown elapsed")
-                        heatProtectionTimer = nil
-                        // Fall through to normal evaluation
-                    } else {
-                        return // Still in hysteresis period
-                    }
-                }
-                // heatProtectionTimer is nil — hysteresis ended, fall through to re-evaluate
+            } else if let lastHot = heatProtectionTimer, Date().timeIntervalSince(lastHot) >= 300 {
+                heatProtectionTimer = nil
+                log.info("Heat protection ended: cooldown elapsed")
             }
+        }
+        if isThermalHoldActive {
+            if mode != .heatProtection {
+                log.warning("Heat protection: inhibiting charging")
+                let wasDischarging = mode == .discharging
+                mode = .heatProtection
+                if wasDischarging { forceDischarge(false) }
+                inhibitCharging()
+            }
+            return
         }
 
         // Top Up mode — stay until unplugged (guard above) or user cancels
@@ -1195,7 +1188,7 @@ final class ChargingManager: ObservableObject {
 
     /// Start Top Up - temporarily charge to 100%
     func startTopUp() {
-        guard canControlCharging, canStartWithBatteryReading, !dischargeStopRequested else {
+        guard !isThermalHoldActive, canControlCharging, canStartWithBatteryReading, !dischargeStopRequested else {
             log.warning("Cannot start Top Up: \(self.controlUnavailableReason, privacy: .public)")
             return
         }
@@ -1218,7 +1211,7 @@ final class ChargingManager: ObservableObject {
 
     /// Manually start discharge
     func startDischarge() {
-        guard canControlCharging, canStartWithBatteryReading, !dischargeStopRequested else {
+        guard !isThermalHoldActive, canControlCharging, canStartWithBatteryReading, !dischargeStopRequested else {
             log.warning("Cannot start discharge: \(self.controlUnavailableReason, privacy: .public)")
             return
         }
@@ -1261,6 +1254,7 @@ final class ChargingManager: ObservableObject {
         if !isHelperInstalled { return "helper not installed" }
         if chargingAPI == .unknown { return "no charging API detected" }
         if dischargeStopRequested { return "waiting for discharge to stop" }
+        if isThermalHoldActive { return "thermal protection is active" }
         if !canStartWithBatteryReading { return "battery reading unavailable" }
         return "unknown"
     }

@@ -29,7 +29,8 @@ final class LocalActivityPreferences: ObservableObject {
 @MainActor
 final class LocalActivityRecorder: ObservableObject {
     static let shared = LocalActivityRecorder()
-    @Published private(set) var revision: UInt64 = 0
+    @Published private(set) var eventRevision: UInt64 = 0
+    @Published private(set) var historyRevision: UInt64 = 0
     @Published private(set) var storageError: String?
     let store: LocalActivityStore
     private let battery: BatteryService
@@ -57,9 +58,11 @@ final class LocalActivityRecorder: ObservableObject {
     func start() {
         guard !running else { return }
         running = true
+        lastAC = nil
+        lastLimit = nil
         accumulator = MinuteHistoryAccumulator()
         let retention = preferences.retention
-        enqueue { try await $0.setRetention(retention) }
+        enqueue(affectsEvents: true) { try await $0.setRetention(retention) }
         record(.init(at: now(), category: .application, code: "application.started"), deduplicateFor: 0)
         battery.$batteryState.sink { [weak self] in self?.observe($0) }.store(in: &cancellables)
         charging.$mode.removeDuplicates().sink { [weak self] mode in
@@ -68,14 +71,21 @@ final class LocalActivityRecorder: ObservableObject {
         charging.policyEvents.sink { [weak self] in self?.recordPolicy($0) }.store(in: &cancellables)
         MonthlyFullChargeService.shared.events.sink { [weak self] in self?.recordMonthly($0) }.store(in: &cancellables)
         helper.events.sink { [weak self] in self?.record($0) }.store(in: &cancellables)
+        var previousRetention = retention
         preferences.$minuteRetentionDays.combineLatest(preferences.$eventRetentionDays).dropFirst()
             .sink { [weak self] minuteDays, eventDays in
                 let retention = LocalActivityRetention(minuteDays: minuteDays, eventDays: eventDays, healthDays: 366)
-                self?.enqueue { try await $0.setRetention(retention) }
+                self?.enqueue(affectsHistory: retention.minuteDays != previousRetention.minuteDays,
+                              affectsEvents: retention.eventDays != previousRetention.eventDays) {
+                    try await $0.setRetention(retention)
+                }
+                previousRetention = retention
             }.store(in: &cancellables)
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
             .sink { [weak self] _ in
                 Task { @MainActor in
+                    self?.lastAC = nil
+                    self?.lastLimit = nil
                     self?.flushMinute()
                     self?.accumulator = MinuteHistoryAccumulator()
                     self?.record(.init(category: .application, code: "application.sleep"))
@@ -110,18 +120,34 @@ final class LocalActivityRecorder: ObservableObject {
         await persistence?.value
         try await store.clearHistory()
         accumulator = MinuteHistoryAccumulator()
-        revision &+= 1
+        historyRevision &+= 1
     }
     func clearEvents() async throws {
         await persistence?.value
         try await store.clearEvents()
-        revision &+= 1
+        eventRevision &+= 1
     }
+
+    private var lastLimit: Int?
+    private var lastAC: Bool?
 
     private func observe(_ state: BatteryState) {
         guard running else { return }
         let timestamp = now()
-        if let minute = accumulator.add(.init(state: state, at: timestamp)) {
+        let limit = charging.isUsingNativeChargeLimit ? charging.effectiveNativeChargeLimit
+            : charging.supportsSMCControls ? charging.settings.chargeLimit : nil
+        let reading = BatteryHistoryReading(state: state, at: timestamp, limit: limit)
+        if let ac = reading.onAC, let lastAC, ac != lastAC {
+            record(.init(at: timestamp, category: .charging, code: "charging.sourceChanged",
+                         values: ["ac": String(ac)]), deduplicateFor: 0)
+        }
+        if !charging.isUsingNativeChargeLimit, let limit, let lastLimit, limit != lastLimit {
+            record(.init(at: timestamp, category: .charging, code: "charging.targetChanged",
+                         values: ["limit": String(limit)]), deduplicateFor: 0)
+        }
+        lastAC = reading.onAC
+        lastLimit = limit
+        if let minute = accumulator.add(reading) {
             enqueue { try await $0.append(minute) }
         }
         let key = "\(state.hasValidBatteryReading)-\(state.isPluggedIn)-\(state.isCharging)-\(state.notChargingReason ?? 0)-\(state.chargerInhibitReason ?? 0)"
@@ -140,10 +166,10 @@ final class LocalActivityRecorder: ObservableObject {
     }
 
     func record(_ event: LocalActivityEvent, deduplicateFor seconds: TimeInterval = 30) {
-        enqueue { _ = try await $0.append(event, deduplicateFor: seconds) }
+        enqueue(affectsHistory: false, affectsEvents: true) { _ = try await $0.append(event, deduplicateFor: seconds) }
     }
 
-    private func enqueue(_ operation: @escaping @Sendable (LocalActivityStore) async throws -> Void) {
+    private func enqueue(affectsHistory: Bool = true, affectsEvents: Bool = false, _ operation: @escaping @Sendable (LocalActivityStore) async throws -> Void) {
         let previous = persistence
         let store = store
         persistence = Task { [weak self] in
@@ -151,7 +177,8 @@ final class LocalActivityRecorder: ObservableObject {
             do {
                 try await operation(store)
                 self?.storageError = nil
-                self?.revision &+= 1
+                if affectsHistory { self?.historyRevision &+= 1 }
+                if affectsEvents { self?.eventRevision &+= 1 }
             } catch {
                 self?.storageError = error.localizedDescription
             }

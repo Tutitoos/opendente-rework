@@ -4,6 +4,19 @@ import Testing
 
 @Suite("History chart presentation")
 struct HistoryChartPresentationTests {
+    @MainActor @Test func dailyLabelsKeepTheUTCPartitionDate() throws {
+        let date = try #require(ISO8601DateFormatter().date(from: "2026-11-19T00:00:00Z"))
+        let chart = HistoryChart(series: [], isDaily: true)
+        #expect(chart.dateFormat.timeZone == .gmt)
+        #expect(chart.chartTimeZone == .gmt)
+        let utcLabel = L10n.date(date, timeZone: chart.chartTimeZone)
+        for (name, sameDay) in [("America/Los_Angeles", false), ("Europe/Madrid", true)] {
+            let local = try #require(TimeZone(identifier: name))
+            #expect((L10n.date(date, timeZone: local) == utcLabel) == sameDay)
+        }
+        #expect(HistoryChart(series: []).chartTimeZone == .current)
+    }
+
     @Test func threeSingleMinuteSessionsRemainVisibleWithoutConnectingGaps() {
         let start = Date(timeIntervalSince1970: 1_800_000_000)
         let rows = (0..<3).map {
@@ -52,6 +65,24 @@ struct HistoryChartPresentationTests {
         #expect(capacity.contains(104.8))
         #expect(capacity.contains(100))
         #expect(capacity.lowerBound > 0)
+    }
+
+    @Test func detailScaleKeepsContextForFlatChargeAndRespectsBatteryBounds() {
+        #expect(HistoryChartScale.chargeDetailDomain(80...80) == 75...85)
+        #expect(HistoryChartScale.chargeDetailDomain(99...100) == 90...100)
+        #expect(HistoryChartScale.chargeDetailDomain(0...1) == 0...10)
+        #expect(HistoryChartScale.chargeDetailDomain(10...90) == 5...95)
+    }
+
+    @Test func briefDipAndPeakRemainVisibleAtLongRanges() {
+        let start = Date()
+        let points = (0..<3000).map { index in
+            HistoryPlotPoint(timestamp: start.addingTimeInterval(Double(index * 60)),
+                             value: index == 501 ? 79 : index == 502 ? 81 : 80, segment: 0)
+        }
+        let series = HistoryChartSeries(metric: .charge, points: points)
+        #expect(series.observedRange == 79...81)
+        #expect(series.plottedPoints.filter { $0.value != 80 }.map(\.value) == [79, 81])
     }
 
     @Test func signedPowerKeepsBothDirectionsAndZeroVisible() {
@@ -103,11 +134,13 @@ struct HistoryChartPresentationTests {
     }
 
     @Test func dailyInspectionLeavesMissingDaysEmptyAndRestoresTheLatestReading() {
-        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let start = LocalActivityStore.day(Date(timeIntervalSince1970: 1_800_000_000))
         let series = HistoryChartSeries(metric: .appleHealth, points: [
             .init(timestamp: start, value: 99, segment: 0),
             .init(timestamp: start.addingTimeInterval(2 * 86_400), value: 98, segment: 1)
         ])
+        #expect(series.reading(at: start.addingTimeInterval(86_399), isDaily: true)?.value == 99)
+        #expect(series.reading(at: start.addingTimeInterval(2 * 86_400 - 1), isDaily: true) == nil)
         #expect(series.reading(at: start.addingTimeInterval(86_400), isDaily: true) == nil)
         #expect(series.reading(at: nil, isDaily: true)?.value == 98)
     }

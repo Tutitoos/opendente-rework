@@ -58,7 +58,9 @@ final class MonthlyFullChargeService: ObservableObject {
     @Published private(set) var nextChargeDate: Date?
     @Published private(set) var errorMessage: String?
     @Published private(set) var errorSource: Error?
-    @Published private(set) var canStart = false
+    enum Availability { case unknown, available, unsupported, checkFailed }
+    @Published private(set) var availability = Availability.unknown
+    var canStart: Bool { availability == .available }
 
     var enabled: Bool { settings.monthlyFullChargeEnabled }
     var isCharging: Bool { settings.monthlyFullChargeCycle != nil || settings.monthlyChargeRecoveryUnknown }
@@ -214,6 +216,17 @@ final class MonthlyFullChargeService: ObservableObject {
         processing = true
         defer { processing = false }
         guard loadJournal() else { return }
+        if let cycle = settings.monthlyFullChargeCycle {
+            if cycle.restorationPending {
+                guard status != .failed else { return }
+                finishCycle(outcome: cycle.reachedFullAt != nil ? .completed : .cancelled, failure: nil)
+                return
+            }
+            if now().timeIntervalSince(cycle.startedAt) >= 24 * 60 * 60 {
+                finishCycle(outcome: .cancelled, failure: MonthlyFullChargeError.interrupted)
+                return
+            }
+        }
         guard state.hasValidBatteryReading else { return }
         let observedFull = state.percentage >= 100
         let fullCountsForDuePeriod = enabled && nextChargeDate.map { $0 <= now() } == true
@@ -227,11 +240,6 @@ final class MonthlyFullChargeService: ObservableObject {
         settings.monthlyPreviouslyObservedFull = observedFull
 
         if var cycle = settings.monthlyFullChargeCycle {
-            if cycle.restorationPending {
-                guard status != .failed else { return }
-                finishCycle(outcome: cycle.reachedFullAt != nil ? .completed : .cancelled, failure: nil)
-                return
-            }
             if observedFull {
                 cycle.reachedFullAt = now()
                 do { try persistCycle(cycle) }
@@ -258,7 +266,7 @@ final class MonthlyFullChargeService: ObservableObject {
                 finishCycle(outcome: .failed, failure: error)
                 return
             }
-            if !state.isPluggedIn || now().timeIntervalSince(cycle.startedAt) >= 24 * 60 * 60 {
+            if !state.isPluggedIn {
                 finishCycle(outcome: .cancelled, failure: MonthlyFullChargeError.interrupted)
                 return
             }
@@ -282,16 +290,22 @@ final class MonthlyFullChargeService: ObservableObject {
         }
         refreshAvailability()
         guard canStart else {
-            fail(MonthlyFullChargeError.unavailable)
+            let checkError = availability == .checkFailed ? errorSource : nil
+            fail(checkError ?? MonthlyFullChargeError.unavailable)
             return
         }
         beginCycle()
     }
 
-    private func refreshAvailability() {
-        guard journalError == nil else { canStart = false; return }
-        do { canStart = try control.temporaryFullChargeAvailable() }
-        catch { canStart = false; setError(error) }
+    func refreshAvailability() {
+        guard journalError == nil else { availability = .unknown; return }
+        do {
+            availability = try control.temporaryFullChargeAvailable() ? .available : .unsupported
+            if !enabled && status == .disabled { setError(nil) }
+        } catch {
+            availability = .checkFailed
+            setError(error)
+        }
     }
 
     private func schedule(from date: Date, preservingStatus: Bool = false) {
@@ -415,7 +429,7 @@ final class MonthlyFullChargeService: ObservableObject {
         } catch {
             journalError = error
             settings.monthlyChargeRecoveryUnknown = true
-            canStart = false
+            availability = .unknown
             fail(error)
             return false
         }

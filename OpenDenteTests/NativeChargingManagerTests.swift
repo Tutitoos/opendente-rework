@@ -297,6 +297,19 @@ struct NativeChargingManagerTests {
         #expect(fixture.native.writes.isEmpty)
     }
 
+    @Test func lateHelperDetectionRecoversUnsupportedNativeBackend() {
+        let fixture = NativeManagerFixture()
+        defer { fixture.cleanUp() }
+        fixture.native.readError = NativeChargeLimitError.unavailable
+        fixture.manager.isHelperInstalled = true
+        fixture.manager.start()
+        #expect(fixture.manager.isUsingNativeChargeLimit)
+        fixture.manager.chargingAPI = .legacy
+        fixture.manager.refreshNativeChargingPolicy()
+        #expect(fixture.manager.supportsSMCControls)
+        #expect(fixture.native.writes.isEmpty)
+    }
+
     @Test func transientNativeReadFailureNeverEnablesSMCWrites() {
         let fixture = NativeManagerFixture(smcAPI: .legacy)
         defer { fixture.cleanUp() }

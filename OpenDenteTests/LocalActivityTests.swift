@@ -4,6 +4,86 @@ import Testing
 
 @Suite("Local battery activity")
 struct LocalActivityTests {
+    @Test func usageSplitsAtMinuteBoundaryAndAtPowerReversal() throws {
+        let minute = Date(timeIntervalSince1970: 1_800_000_000)
+        func sample(_ offset: Double, _ watts: Double, _ ac: Bool) -> BatteryHistoryReading {
+            var value = BatteryHistoryReading(timestamp: minute.addingTimeInterval(offset), values: [.batteryPower: watts])
+            value.onAC = ac
+            return value
+        }
+        var accumulator = MinuteHistoryAccumulator()
+        _ = accumulator.add(sample(-4, -18, true))
+        let before = try #require(accumulator.add(sample(4, 18, true))?.usage)
+        _ = accumulator.add(sample(8, 18, false))
+        _ = accumulator.add(sample(35, 18, false))
+        let after = try #require(accumulator.flush()?.usage)
+        #expect(before.acSeconds == 4 && after.acSeconds == 4)
+        #expect(after.batterySeconds == 0 && after.energySeconds == 8)
+        #expect(abs(before.dischargedWh - 0.01) < 0.000001)
+        #expect(abs(after.chargedWh - 0.03) < 0.000001)
+        #expect(before.chargedWh == 0 && after.dischargedWh == 0)
+    }
+
+    @Test func historicalContextIsOptionalAndTargetsKeepTransitions() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = LocalActivityStore(directory: folder)
+        let start = Date(timeIntervalSince1970: 1_800_000_000), session = UUID()
+        let now = start.addingTimeInterval(360)
+        for (i, target) in [nil, 80, 80, 80, 90, nil].enumerated() {
+            var row = activityMinute(start.addingTimeInterval(Double(i * 60)), values: [.charge: Double(70 + i)], session: session)
+            row.limit = target
+            try await store.append(row, now: now)
+        }
+        let result = try await store.chartHistory(since: start, metric: .charge, now: now)
+        #expect(result.targets.first?.timestamp == start.addingTimeInterval(60))
+        #expect(result.targets.last?.value == 90)
+        #expect(result.usage.energySeconds == 0 && result.sources.isEmpty)
+        #expect(result.firstCharge == 70 && result.lastCharge == 75)
+    }
+
+    @Test func timelineKeepsOnlyRelevantEventsInsideSelectedPeriod() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = LocalActivityStore(directory: folder)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        for (seconds, code) in [(-30, "application.sleep"), (-10, "application.wake"), (-8, "application.started"), (-2, "charging.modeObserved")] {
+            try await store.append(.init(at: now.addingTimeInterval(Double(seconds)), category: .application, code: code), now: now)
+        }
+        let snapshot = try await store.timeline(since: now.addingTimeInterval(-20), until: now)
+        #expect(snapshot.events.map(\.code) == ["application.wake", "charging.modeObserved"])
+    }
+
+    @Test func lateMinuteCanFillMissingMetricButCannotRollBackDailyHealth() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = LocalActivityStore(directory: folder)
+        let early = Date(timeIntervalSince1970: 1_800_000_000)
+        let late = early.addingTimeInterval(120), now = late.addingTimeInterval(60)
+        try await store.append(activityMinute(late, values: [.cycles: 102, .appleHealth: 98]), now: now)
+        try await store.append(activityMinute(early, values: [.cycles: 100, .openDenteHealth: 92]), now: now)
+        let snapshot = try await store.history(since: early, now: now)
+        let day = try #require(snapshot.dailyHealth.first)
+        #expect(day.cycleCount == 102 && day.cyclesObservedAt == late.addingTimeInterval(58))
+        #expect(day.applePercentage == 98 && day.openDentePercentage == 92)
+        #expect(day.lastObservedAt == late.addingTimeInterval(58))
+    }
+
+    @Test func pruningOnlyRemovesCanonicalPartitionFiles() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = LocalActivityStore(directory: folder)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        try await store.append(activityMinute(now, values: [.charge: 80]), now: now)
+        let minutes = folder.appendingPathComponent("minutes")
+        let names = ["2020-01-01.json", "2020-1-1.jsonl", "2020-01-02.jsonl"]
+        for name in names { try Data().write(to: minutes.appendingPathComponent(name)) }
+        try await store.prune(now: now)
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: minutes.path)
+        #expect(remaining.contains(names[0]) && remaining.contains(names[1]))
+        #expect(!remaining.contains(names[2]))
+    }
+
     @Test func constructionIsInert() async throws {
         let folder = temporaryActivityDirectory()
         _ = LocalActivityStore(directory: folder)
@@ -205,6 +285,54 @@ struct LocalActivityTests {
         #expect(snapshot.damagedRecords == 1)
     }
 
+    @Test func partitionSeparatorCountsTowardLimitAndLegacyOverflowIsReadable() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        let event = LocalActivityEvent(at: date, category: .application, code: "started")
+        let store = LocalActivityStore(directory: folder)
+        try await store.append(event, now: date)
+        let url = try #require(FileManager.default.contentsOfDirectory(at: folder.appendingPathComponent("events"),
+            includingPropertiesForKeys: nil).first)
+        let line = try Data(contentsOf: url)
+        let limit = LocalActivityStore.maximumPartitionBytes
+        let truncated = Data(repeating: 120, count: limit - line.count)
+        try truncated.write(to: url)
+        await #expect(throws: LocalActivityStorageError.self) {
+            try await store.append(event, deduplicateFor: 0, now: date)
+        }
+        #expect(try Data(contentsOf: url) == truncated)
+        try Data(truncated.dropLast()).write(to: url)
+        try await store.append(event, deduplicateFor: 0, now: date)
+        #expect(try Data(contentsOf: url).count == limit)
+        try (truncated + Data([10]) + line).write(to: url)
+        let snapshot = try await store.events(now: date)
+        #expect(snapshot.events.map(\.id) == [event.id])
+        #expect(snapshot.damagedRecords == 1)
+    }
+
+    @Test func latestEventsSkipOlderPartitionsAndExportStillReadsAll() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = LocalActivityStore(directory: folder)
+        for offset in [-86_400, 0, -60] {
+            let event = LocalActivityEvent(at: now.addingTimeInterval(Double(offset)), category: .application, code: "sample")
+            try await store.append(event, deduplicateFor: 0, now: now)
+        }
+        let urls = try FileManager.default.contentsOfDirectory(at: folder.appendingPathComponent("events"),
+            includingPropertiesForKeys: nil).sorted { $0.path < $1.path }
+        let oldest = try #require(urls.first)
+        try (Data(contentsOf: oldest) + Data("broken\n".utf8)).write(to: oldest)
+        let limited = try await store.events(now: now, maximum: 2)
+        let all = try await store.events(now: now, maximum: nil)
+        #expect(limited.events.map(\.id) == all.events.prefix(2).map(\.id))
+        #expect(limited.damagedRecords == 0 && all.damagedRecords == 1)
+        let data = try await store.exportEvents(now: now)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect((json["events"] as? [Any])?.count == 3)
+    }
+
     @Test func structuredEventsDeduplicateAndFilterWithoutPersistingTranslatedText() async throws {
         let folder = temporaryActivityDirectory()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -235,7 +363,9 @@ struct LocalActivityTests {
         _ = accumulator.add(.init(state: makeLocalActivityBattery(), at: date))
         let row = accumulator.flush()
         try await store.append(try #require(row), now: date)
-        let exported = try await store.exportHistory(now: date.addingTimeInterval(60))
+        let destination = folder.appendingPathComponent("export.json")
+        try await store.exportHistory(to: destination, now: date.addingTimeInterval(60))
+        let exported = try Data(contentsOf: destination)
         let text = String(decoding: exported, as: UTF8.self)
         #expect(text.contains("systemProfiler"))
         #expect(text.contains("ioRegistry"))
@@ -244,6 +374,59 @@ struct LocalActivityTests {
         #expect(text.contains("openDenteHealth"))
         #expect(!text.contains("PRIVATE-ADAPTER-SERIAL"))
         #expect(!text.contains("serial"))
+    }
+
+    @Test func chartAndExportPreserveMidnightContinuityAndDamagedCount() async throws {
+        let directory = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = LocalActivityStore(directory: directory)
+        let midnight = LocalActivityStore.day(Date())
+        let session = UUID()
+        for offset in [-60, 120, 60, 0] {
+            let date = midnight.addingTimeInterval(Double(offset))
+            let values: [HistoryMetric: Double] = offset == 60 ? [.temperature: 32] : [.charge: Double(70 + offset / 60)]
+            try await store.append(activityMinute(date, values: values, session: session), now: midnight)
+        }
+        let minuteDirectory = directory.appendingPathComponent("minutes")
+        let file = try #require(FileManager.default.contentsOfDirectory(at: minuteDirectory,
+            includingPropertiesForKeys: nil).sorted { $0.path < $1.path }.last)
+        try (Data(contentsOf: file) + Data("bad\n".utf8)).write(to: file)
+        let end = midnight.addingTimeInterval(180)
+        let chart = try await store.chartHistory(since: midnight.addingTimeInterval(-60), metric: .charge, now: end)
+        #expect(chart.points.map(\.segment) == [0, 0, 1])
+        #expect(chart.points.map(\.value) == [69, 70, 72])
+        #expect(chart.damagedRecords == 1)
+        struct Export: Decodable {
+            let minutes: [BatteryHistoryMinute]
+            let dailyHealth: [DailyBatteryHealth]
+            let damagedRecords: Int
+            let exportedAt: Date
+            let timezone: String
+            let schemaVersion: Int
+        }
+        let url = directory.appendingPathComponent("export.json")
+        try await store.exportHistory(to: url, now: end)
+        let contents = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let result = try decoder.decode(Export.self, from: contents)
+        #expect(result.minutes.map(\.timestamp) == [-60, 0, 60, 120].map { midnight.addingTimeInterval(Double($0)) })
+        #expect(result.dailyHealth == chart.dailyHealth && result.damagedRecords == 1)
+        #expect(result.exportedAt == end && result.timezone == "UTC" && result.schemaVersion == 1)
+        try Data(repeating: 32, count: LocalActivityStore.maximumPartitionBytes + 2).write(to: file)
+        await #expect(throws: LocalActivityStorageError.self) { try await store.exportHistory(to: url, now: end) }
+        #expect(try Data(contentsOf: url) == contents)
+    }
+
+    @MainActor @Test func recordingEventsLeavesHistoryRevisionUnchanged() async throws {
+        let folder = temporaryActivityDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let recorder = LocalActivityRecorder(store: LocalActivityStore(directory: folder))
+        recorder.record(.init(category: .application, code: "sample"))
+        await recorder.flush()
+        #expect(recorder.eventRevision == 1 && recorder.historyRevision == 0)
+        try await recorder.clearHistory()
+        #expect(recorder.eventRevision == 1 && recorder.historyRevision == 1)
     }
 
     @Test func clearingHistoryPreservesEventLog() async throws {

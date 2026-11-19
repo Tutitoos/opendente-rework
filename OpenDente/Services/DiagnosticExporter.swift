@@ -8,10 +8,13 @@ private let log = Logger(subsystem: "com.opendente.app", category: "Diagnostics"
 /// One-click diagnostic report generator for troubleshooting.
 /// Collects system info, current state, settings, and recent logs into a text file.
 @MainActor
-enum DiagnosticExporter {
+final class DiagnosticExporter: ObservableObject {
+    static let shared = DiagnosticExporter()
+    @Published private(set) var isExporting = false
 
     /// Show save panel and write diagnostic report.
-    static func exportWithSavePanel() {
+    func exportWithSavePanel() async {
+        guard !isExporting else { return }
         let panel = NSSavePanel()
         panel.title = L10n.tr("Export Diagnostic Report")
         panel.prompt = L10n.tr("Export")
@@ -24,9 +27,8 @@ enum DiagnosticExporter {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        let report = generateReport()
         do {
-            try report.write(to: url, atomically: true, encoding: .utf8)
+            guard try await writeReport(Self.diagnosticSnapshot(), to: url) else { return }
             log.notice("Diagnostic report exported")
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } catch {
@@ -39,8 +41,8 @@ enum DiagnosticExporter {
         }
     }
 
-    /// Generate the full diagnostic report text.
-    static func generateReport() -> String {
+    /// Capture the live state while its owners are on the main actor.
+    private static func diagnosticSnapshot() -> String {
         var r = ""
 
         // Header
@@ -153,14 +155,26 @@ enum DiagnosticExporter {
 
         // Logs
         r += "=== Logs (last 3 days) ===\n"
-        appendLogs(&r)
 
         return r
     }
 
     // MARK: - Private
 
-    private static func appendLogs(_ r: inout String) {
+    func writeReport(_ snapshot: String, to url: URL,
+                            collect: @escaping @Sendable (inout String) -> Void = DiagnosticExporter.appendLogs) async throws -> Bool {
+        guard !isExporting else { return false }
+        isExporting = true
+        defer { isExporting = false }
+        try await Task.detached(priority: .utility) {
+            var report = snapshot
+            collect(&report)
+            try report.write(to: url, atomically: true, encoding: .utf8)
+        }.value
+        return true
+    }
+
+    nonisolated private static func appendLogs(_ r: inout String) {
         do {
             let store = try OSLogStore(scope: .system)
             let threeDaysAgo = Date().addingTimeInterval(-3 * 24 * 60 * 60)
@@ -193,7 +207,7 @@ enum DiagnosticExporter {
         }
     }
 
-    private static func levelString(_ level: OSLogEntryLog.Level) -> String {
+    nonisolated private static func levelString(_ level: OSLogEntryLog.Level) -> String {
         switch level {
         case .debug:       return "debug"
         case .info:        return "info"

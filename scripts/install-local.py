@@ -4,6 +4,7 @@
 Never launches/quits an app, invokes SMAppService, or changes preferences/hardware.
 Only the already installed, compatible helper and LaunchDaemon plist are retained.
 A changed daemon/protocol requires a separate canonical async-unregister upgrade.
+Use a private, installer-owned mode-0700 staging directory on the target volume.
 """
 from __future__ import annotations
 
@@ -276,7 +277,27 @@ class Installer:
             hashes[name] = entry["sha256"]
         return hashes
 
-    def preflight(self) -> None:
+    def verify_staging_directory(self, directory: Path) -> None:
+        owner = os.geteuid()
+        info = directory.stat()
+        require(info.st_uid == owner and stat.S_IMODE(info.st_mode) == 0o700,
+                "Staging parent must be owned by the installer and have mode 0700")
+        # A private leaf can still be replaced through a writable ancestor.
+        for path in (directory, *directory.parents):
+            info = path.stat()
+            require(info.st_uid in (0, owner) and
+                    (info.st_mode & 0o022 == 0 or info.st_mode & stat.S_ISVTX),
+                    f"Staging path can be replaced by another user: {path}")
+            acl = self.system.run("/bin/ls", "-ledn", str(path)).stdout.splitlines()[1:]
+            read_only = {"read", "list", "search", "execute", "readattr", "readextattr", "readsecurity",
+                         "file_inherit", "directory_inherit", "limit_inherit", "only_inherit"}
+            for entry in acl:
+                match = re.fullmatch(r".* (allow|deny) ([a-z_,]+)", entry)
+                require(match is not None and
+                        (match[1] == "deny" or (path != directory and set(match[2].split(",")) <= read_only)),
+                        f"Staging path has an incompatible access grant: {path}")
+
+    def preflight(self) -> Path:
         c = self.config
         require(re.fullmatch(r"[A-Z0-9]{10}", c.team) is not None, "Invalid signing Team ID")
         require(re.fullmatch(r"[0-9A-Fa-f]{40}", c.identity) is not None, "Use an explicit 40-character signing identity SHA-1")
@@ -294,6 +315,7 @@ class Installer:
                 and not c.target.resolve().is_relative_to(c.candidate.resolve()), "Candidate/target paths overlap")
         require(c.staging_parent.is_dir() and not c.staging_parent.is_symlink(), "Staging parent must already exist")
         stage_parent = c.staging_parent.resolve()
+        self.verify_staging_directory(stage_parent)
         require(not stage_parent.is_relative_to(Path("/Applications")) and not stage_parent.is_relative_to(c.target.resolve())
                 and not stage_parent.is_relative_to(c.candidate.resolve()), "Staging must be outside /Applications and both bundles")
         require(stage_parent.stat().st_dev == c.target.parent.stat().st_dev, "Staging and destination must be on the same filesystem")
@@ -318,6 +340,7 @@ class Installer:
         self.candidate_tree = tree_manifest(c.candidate)
         self.report["candidateBeforeRetentionManifest"] = self.candidate_tree
         self.report["previousManifest"] = self.previous_tree
+        return stage_parent
 
     def unchanged_inputs(self) -> None:
         require(tree_manifest(self.config.target) == self.previous_tree, "Installed bundle changed after preflight")
@@ -333,25 +356,26 @@ class Installer:
         os.replace(temporary, target)
 
     def install(self, dry_run: bool = False) -> dict:
-        self.preflight()  # All initial failures happen before any filesystem mutation.
+        stage_parent = self.preflight()  # All initial failures happen before any filesystem mutation.
         if dry_run:
             return self.report | {"dryRun": True, "ready": True}
         c = self.config
         self.no_gui("before-staging")
-        lock_path = c.staging_parent / (".opendente-install-" + hashlib.sha256(str(c.target.resolve()).encode()).hexdigest()[:16] + ".lock")
+        lock_path = stage_parent / (".opendente-install-" + hashlib.sha256(str(c.target.resolve()).encode()).hexdigest()[:16] + ".lock")
         require(not lock_path.is_symlink(), "Refusing a symlinked installation lock")
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.unchanged_inputs()
             self.no_gui("before-copy")
-            run = Path(tempfile.mkdtemp(prefix="opendente-install-", dir=c.staging_parent))
+            run = Path(tempfile.mkdtemp(prefix="opendente-install-", dir=stage_parent))
             stage = run / "OpenDente.app"
             self.report["stagingBundle"] = str(stage)
             self.report["destination"] = str(c.target)
             try:
                 shutil.copytree(c.candidate, stage, symlinks=True)
                 require(tree_manifest(stage) == self.candidate_tree, "Staged copy differs from candidate")
+                self.verify_bundle(stage, c.expected_version, c.expected_build)
                 self.retain_file(c.target / HELPER, stage / HELPER, c.installed_helper_sha256, "before-helper-replacement")
                 self.retain_file(c.target / DAEMON, stage / DAEMON, c.installed_plist_sha256, "before-plist-replacement")
                 self.no_gui("before-staging-signature")

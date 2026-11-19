@@ -575,7 +575,10 @@ struct ChargingTab: View {
                 Text(L10n.tr("Optimized charging control is unavailable on this Mac."))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Button(L10n.tr("Refresh macOS Settings")) { charging.refreshNativeChargingPolicy() }
+            Button(L10n.tr("Refresh macOS Settings")) {
+                charging.refreshNativeChargingPolicy()
+                monthly.refreshAvailability()
+            }
         }
     }
 
@@ -585,6 +588,16 @@ struct ChargingTab: View {
                 get: { monthly.enabled }, set: { monthly.setEnabled($0) }
             ))
             .disabled(!monthly.canStart && !monthly.enabled)
+            if monthly.availability == .unsupported {
+                Text(L10n.tr("This Mac does not support monthly full charging."))
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if monthly.availability == .checkFailed {
+                HStack {
+                    Text(L10n.tr("Could not check monthly charging availability with macOS."))
+                    Button(L10n.tr("Check Again")) { monthly.refreshAvailability() }
+                }
+                .font(.caption)
+            }
             LabeledContent(L10n.tr("Status"), value: monthlyStatusLabel)
             LabeledContent(L10n.tr("Last Full Charge"), value: monthly.lastFullChargeDate.map { L10n.date($0, includeTime: true) } ?? "—")
             if monthly.enabled {
@@ -605,10 +618,6 @@ struct ChargingTab: View {
             }
             Text(L10n.tr("Runs while OpenDente is active and the Mac is plugged in. The usual limit is restored when the battery reaches 100%, or when you cancel."))
                 .font(.caption).foregroundStyle(.secondary)
-            if !monthly.canStart {
-                Text(L10n.tr("Monthly full charging requires native charging support on this Mac."))
-                    .font(.caption).foregroundStyle(.secondary)
-            }
         }
     }
 
@@ -787,6 +796,7 @@ struct PopoverItemRow: View {
 // MARK: - Battery Info Tab
 
 struct BatteryInfoTab: View {
+    @ObservedObject private var exporter = DiagnosticExporter.shared
     @ObservedObject private var language = LanguageManager.shared
     @ObservedObject var battery = BatteryService.shared
     @ObservedObject var charging = ChargingManager.shared
@@ -942,9 +952,10 @@ struct BatteryInfoTab: View {
             }
 
             Section {
-                Button(L10n.tr("Export Diagnostic Report...")) {
-                    DiagnosticExporter.exportWithSavePanel()
+                Button(L10n.tr(exporter.isExporting ? "Exporting…" : "Export Diagnostic Report...")) {
+                    Task { await exporter.exportWithSavePanel() }
                 }
+                .disabled(exporter.isExporting)
                 Text(L10n.tr("Exports system info, current state, settings, and recent logs as a text file for troubleshooting."))
                     .font(.caption)
                     .foregroundStyle(.secondary)

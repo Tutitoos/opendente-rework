@@ -106,16 +106,51 @@ final class ChargingControlRegressionTests: XCTestCase {
         XCTAssertEqual(manager.mode, .heatProtection)
         helper.clearCalls()
 
+        manager.evaluateState(makeBatteryState(percentage: 60, temperature: 33))
+        manager.startTopUp()
+        manager.startDischarge()
+        XCTAssertEqual(manager.mode, .heatProtection)
+        XCTAssertTrue(helper.calls.isEmpty)
+
         // Even an elapsed timer does not prove cooling without a sensor reading.
         manager.heatProtectionTimer = Date().addingTimeInterval(-301)
         manager.evaluateState(makeBatteryState(percentage: 60, temperature: nil))
         XCTAssertEqual(manager.mode, .heatProtection)
         XCTAssertFalse(helper.calls.contains(.enableCharging))
+        manager.startTopUp()
+        XCTAssertEqual(manager.mode, .heatProtection)
         XCTAssertNotNil(manager.heatProtectionTimer)
 
         manager.evaluateState(makeBatteryState(percentage: 60, isCharging: true, temperature: 33))
         XCTAssertEqual(manager.mode, .charging)
         XCTAssertEqual(helper.calls, [.enableCharging])
+        manager.startTopUp()
+        XCTAssertEqual(manager.mode, .topUp)
+    }
+
+    func testInvalidTemperatureCannotEndElapsedCooldown() {
+        settings.heatProtectionEnabled = true
+        settings.heatProtectionTemp = 35
+        manager.evaluateState(makeBatteryState(percentage: 60, temperature: 40))
+        manager.heatProtectionTimer = Date().addingTimeInterval(-301)
+        helper.clearCalls()
+        for invalid in [Double.nan, -Double.infinity, -128] {
+            manager.evaluateState(makeBatteryState(percentage: 60, temperature: invalid))
+            XCTAssertEqual(manager.mode, .heatProtection)
+            XCTAssertFalse(helper.calls.contains(.enableCharging))
+        }
+    }
+
+    func testReplugCannotClearThermalHoldWithoutACoolReading() {
+        settings.heatProtectionEnabled = true
+        settings.heatProtectionTemp = 35
+        manager.evaluateState(makeBatteryState(percentage: 60, temperature: 40))
+        manager.evaluateState(makeBatteryState(percentage: 60, isPluggedIn: false))
+        helper.clearCalls()
+        manager.startTopUp()
+        manager.evaluateState(makeBatteryState(percentage: 60, temperature: nil))
+        XCTAssertEqual(manager.mode, .heatProtection)
+        XCTAssertFalse(helper.calls.contains(.enableCharging))
     }
 
     func testStopDischargeWithAutomaticDischargeEnabledSurvivesNextPoll() {

@@ -204,6 +204,17 @@ final class DisplayLogicTests: XCTestCase {
         XCTAssertNil(result)
     }
 
+    func testTopUpHelpDistinguishesCooldownAndMissingTemperature() {
+        XCTAssertEqual(PopoverView.topUpHelpKey(native: false, thermalHold: true, temperature: 33),
+                       "Waiting for the battery to cool down")
+        XCTAssertEqual(PopoverView.topUpHelpKey(native: false, thermalHold: true, temperature: nil),
+                       "Waiting for a temperature reading")
+        XCTAssertEqual(PopoverView.topUpHelpKey(native: false, thermalHold: false, temperature: nil),
+                       "Top Up to 100%")
+        XCTAssertEqual(PopoverView.topUpHelpKey(native: true, thermalHold: false, temperature: nil),
+                       "Choose 100% below to change the native limit")
+    }
+
     // MARK: - canDischarge
 
     func testCanDischarge_pluggedInAboveLimit_true() {
